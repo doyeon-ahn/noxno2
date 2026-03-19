@@ -2,6 +2,9 @@
 d_home=			'/Users/dahn/'
 d_noxno2=       d_home+'/da_projects/d_noxno2/'
 d_code=         d_noxno2+'d_python/'
+d_hysplit=      '/Users/dahn/hysplit/'
+d_era52arl=     '/Users/dahn/hysplit_data2arl/era52arl/'
+d_era5=         '/Volumes/ic/era5_global/'
 
 d_cems=			'/discover/nobackup/dahn/data/cems/'
 d_trop=			'/Volumes/ic/tropomi_keyvars_2018-/'
@@ -15,5 +18,6 @@ DATA_VER=   {
 }
 
 PRCS_VER = {
-    "trop":         'v26.03.07',
+    'trop':         'v26.03.07',
+	'hystraj':		'v26.03.07',
 }

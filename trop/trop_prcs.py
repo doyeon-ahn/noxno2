@@ -24,8 +24,8 @@ CFG=							{	'TROP_PRCS_VER':	CT.PRCS_VER["trop"],
 															"surface_altitude", "surface_pressure",
 															"water_slant_column_density",
 															"water_liquid_slant_column_density" ],
-									'o_save_clipping_csv':	False,
-									'o_save_data_nc':		True,
+									'o_save_clipping_csv':	True,
+									'o_save_data_nc':		False,
 									'snapshot':				True}
 
 target=							pd.read_csv(CFG['target_list'])
@@ -112,8 +112,6 @@ def _trop_prcs(CFG, target, d_in):
 						os.makedirs(d_out)
 					f_out=			f"{file.split('/')[-1]}_{tname[i]}_{CFG['TROP_PRCS_VER']}.nc"
 					ds_sub.to_netcdf(d_out + f_out, encoding=encoding)
-					print( d_out + f_out)
-
 
 ## Run
 _=					_trop_prcs(CFG=CFG, target=target, d_in=CT.d_trop)
