@@ -1,4 +1,4 @@
-facilityId,facilityName,state,latitude,longitude,primaryFuel
+facilityId,facilityName,state,lat,lon,primaryFuel
 3,Barry,AL,31.0069,-88.0103,Pipeline Natural Gas
 7,Gadsden,AL,34.0128,-85.9708,Pipeline Natural Gas
 8,Gorgas,AL,33.6446,-87.2003,Coal
