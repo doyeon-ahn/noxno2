@@ -1,9 +1,7 @@
 import os, sys, glob, IPython, xarray as xr, numpy as np, pandas as pd
-sys.path.insert(0, "..")
-import CT, FN
-"""
+#sys.path.insert(0, "..")
+#import CT, FN
 Read and process TROPOMI .nc files
-"""
 ## PARAMETERS
 CFG=							{	'TROP_PRCS_VER':	CT.PRCS_VER["trop"],
 									'TROP_DATA_VER':	CT.DATA_VER["trop"],
@@ -25,7 +23,7 @@ CFG=							{	'TROP_PRCS_VER':	CT.PRCS_VER["trop"],
 															"water_slant_column_density",
 															"water_liquid_slant_column_density" ],
 									'o_save_clipping_csv':	True,
-									'o_save_data_nc':		False,
+									'o_save_data_nc':		True,
 									'snapshot':				True}
 
 target=							pd.read_csv(CFG['target_list'])
@@ -60,7 +58,8 @@ def _trop_prcs(CFG, target, d_in):
 
 	## Read .nc files
 	files=						sorted(glob.glob(d_in + FN._FILENAME(data='trop', p_data={'processingMode':CFG['processingMode'], 'YYYYMMDD':CFG['YYYYMMDD'], 'orbitID':CFG['orbitID']})))
-	for i_file, file in enumerate(files):
+	#for i_file, file in enumerate(files):
+	for i_file in range(16293, len(files)):
 		file=	files[i_file]
 		print(f"	Processing ... {i_file}/{len(files)}: {file}")
 
@@ -119,5 +118,5 @@ _=					_trop_prcs(CFG=CFG, target=target, d_in=CT.d_trop)
 ## History
 if CFG['snapshot'] == 'True':
 	TAG=			f"{CFG['TROP_PRCS_VER']}"
-	_=				FN._SNAPSHOT(name="trop_prcs", tag=TAG, scripts=['trop_prcs.py'], cfg=CFG, out_dir=os.path.join(CT.d_satcsf, "d_history"))
+	_=				FN._SNAPSHOT(name="trop_prcs", tag=TAG, scripts=['trop_prcs.py'], cfg=CFG, out_dir=os.path.join(CT.d_noxno2, "d_history"))
 

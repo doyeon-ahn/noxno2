@@ -38,5 +38,5 @@ def _func_nox_lifetime(t, Q, lifetime):
 	return (Q * np.exp(-1.*t/lifetime))
 
 def _gaussian(x, a0, a1, a2, a3, a4):
-	return (	a0 + (a1*x) + (a2*np.exp(-4.*np.log(2)*((x-a3)**2) * (a4**-2)))		)							# Reuter et al. (2019)
+	return (a0 + (a1*x) + (a2*np.exp(-4.*np.log(2)*((x-a3)**2) * (a4**-2))))							# Reuter et al. (2019)
 

@@ -6,7 +6,7 @@ d_hysplit=      '/Users/dahn/hysplit/'
 d_era52arl=     '/Users/dahn/hysplit_data2arl/era52arl/'
 d_era5=         '/Volumes/ic/era5_global/'
 
-d_cems=			'/discover/nobackup/dahn/data/cems/'
+d_cems=			d_noxno2+'d_in/cems/'
 d_trop=			'/Volumes/ic/tropomi_keyvars_2018-/'
 d_trop_target=	d_noxno2+'d_dat/trop/'
 
@@ -20,4 +20,7 @@ DATA_VER=   {
 PRCS_VER = {
     'trop':         'v26.03.07',
 	'hystraj':		'v26.03.07',
+	'csf':			'v26.03.07',
+	'post':			'v26.03.07',
+
 }

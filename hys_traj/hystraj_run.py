@@ -8,7 +8,7 @@ import CT, FN
 ## Parameters ____
 CFG=	{	'HYSTRAJ_RUN_VER':			CT.PRCS_VER["hystraj"],
 			'target_list':				CT.df_target,
-			'traj_starting_time':		['trop', CT.DATA_VER["trop"], CT.PRCS_VER["trop"]], 
+			'traj_starting_time':		['trop', CT.DATA_VER["trop"], CT.PRCS_VER["trop"], '2019-01-01', '2025-12-31'], 
 			'TROP_PRCS_VER':			CT.PRCS_VER['trop'],
 			'traj_mode':				'plume',	# 'plume': Simulate urban plume (forward); 'bg': Simulate background area (backward)
 			'o_make_emitime':			False,		# default: False
@@ -64,13 +64,12 @@ def _hysplit_write_setup():
 def _hystraj_make_control(CFG, target):
 	## Loop each target
 	for it in range(0, len(target)): 
-	#for it in range(0, 1): #vvvvv
 		print							(f"	Processing ... {it}/{len(target)}: {target.loc[it,'facilityId']}, {target.loc[it,'facilityName']}")
-		tname=							(target.loc[it,"facilityId"]+'_'+target.loc[it,"facilityName"]).replace(' ', '')
+		tname=							(target.loc[it,"facilityId"]+'_'+target.loc[it,"facilityName"]).replace(' ', '_')
 
 		## Read satellite observation time
 		if CFG['traj_starting_time'][0] == 'trop':
-			d_sate=						CT.d_trop_target+'/'+CFG['TROP_PRCS_VER']+'/d_nc/'+tname+'/'
+			d_sate=						CT.d_trop_target+CFG['TROP_PRCS_VER']+'/d_nc/'+tname+'/'
 			f_sate=						sorted(glob.glob(d_sate + f"*_{tname}_{CFG['TROP_PRCS_VER']}.nc"))
 			time_utc_list= 				[]
 			for f in f_sate:
@@ -79,6 +78,7 @@ def _hystraj_make_control(CFG, target):
 					time_utc_list.append(time_val)
 			sate= 						pd.DataFrame({'time_utc': time_utc_list})
 			sate['time_utc']=			pd.to_datetime(sate['time_utc'])#, format='ISO8601')
+			sate=						sate[(sate['time_utc'] >= CFG['traj_starting_time'][3]) & (sate['time_utc'] <= CFG['traj_starting_time'][4])].reset_index(drop=True)
 
 		# Define dir names
 		d_cdump=						CT.d_noxno2+'d_dat/hysplit/'+CFG['HYSTRAJ_RUN_VER']+'/'+tname+'/cdump/'
