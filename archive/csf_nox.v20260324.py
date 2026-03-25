@@ -1,6 +1,6 @@
 # =============================================================================
 # csf_geoscf_nox.py  —	GEOS-CF-driven NOx emission workflow
-# Drop-in companion to csf_prcs.py (v20260324)
+# Drop-in companion to csf_prcs.py (v20260323)
 # =============================================================================
 # Implements the five-step PSS back-calculation workflow using GEOS-CF fields:
 #	Step 1 — PSS ratio along trajectory		  (j_NO2, O3, T from GEOS-CF)
@@ -19,11 +19,11 @@
 #	oxi_inst_1hr_glo_L1440x721_v72	→  OH  [mol mol-1]	(for Option B k_loss)
 #
 # All GEOS-CF files are expected to follow the v2 file-naming convention:
-#	GEOS.cf.ana.<collection>.<yyyyMMdd_hhmmz>.RX.nc4	# R1: the first revision of the file; Reads whatever revision version exist in dir
+#	GEOS.cf.ana.<collection>.<yyyyMMdd_hhmmz>.R0.nc4
 # and be reachable via the NCCS OPeNDAP or local mirror path CT.d_geoscf.
 # =============================================================================
 
-import os, IPython, glob
+import os
 import math
 import numpy as np
 import pandas as pd
@@ -66,25 +66,31 @@ _JNO2_OVERHEAD = 8.5e-3    # [s-1]
 def _geoscf_filepath(collection, timestamp_utc, d_geoscf, mode="ana"):
 	"""
 	Build the full path to a GEOS-CF v2 NetCDF-4 file.
+
 	Parameters
 	----------
 	collection	  : str   e.g. "chm_tavg_1hr_glo_L1440x721_slv"
 	timestamp_utc : pd.Timestamp  (tz-naive UTC)
 	d_geoscf	  : str   root directory, e.g. CT.d_geoscf
 	mode		  : str   "ana" or "fcst"
+
 	Returns
 	-------
 	str  full file path
 	"""
-	# Round DOWN to nearest collection hour (tavg files are stamped at hh:30, inst files at hh:00; we just match the hour for look-up)
+	# Round DOWN to nearest collection hour (tavg files are stamped at hh:30,
+	# inst files at hh:00; we just match the hour for look-up)
 	ts	  = pd.Timestamp(timestamp_utc)
 	hh	  = ts.floor("h").strftime("%H")
 	mm	  = "30" if "tavg" in collection else "00"
 	stamp = f"{ts.strftime('%Y%m%d')}_{hh}{mm}z"
-	fname = f"GEOS.cf.{mode}.{collection}.{stamp}*nc4" # * denotes R0: the original version of the file, R1: the first revision of the file, ...
-	ddir  = os.path.join(d_geoscf, "NRTv2", "pub", mode, f"Y{ts.strftime('%Y')}", f"M{ts.strftime('%m')}", f"D{ts.strftime('%d')}")
-	df = glob.glob(os.path.join(ddir, fname))
-	return df[0] if df else ""
+	fname = f"GEOS.cf.{mode}.{collection}.{stamp}.R0.nc4"
+	ddir  = os.path.join(d_geoscf, "NRTv2", "pub", mode,
+						 f"Y{ts.strftime('%Y')}",
+						 f"M{ts.strftime('%m')}",
+						 f"D{ts.strftime('%d')}")
+	return os.path.join(ddir, fname)
+
 
 def _geoscf_interp_point(fpath, varname, lat, lon, lev_idx=0):
 	"""
@@ -341,101 +347,9 @@ def step1_pss_ratio(trop_csf, tdump, d_geoscf, suffix="_O", rsq_min=0.7, d_gap_m
 # STEP 2 — Identify the PSS point (quality screen + flux peak)
 # =============================================================================
 
-from scipy.optimize import curve_fit
-
-def _lognormal_pulse(t, A, t_peak, sigma):
-	"""
-	Unimodal log-normal pulse shape for NO2 flux vs. transport age.
-		f(t) = A * exp( -(ln(t / t_peak))^2 / (2 * sigma^2) )
-	Defined only for t > 0; returns 0 elsewhere.
-	"""
-	t	  = np.asarray(t, dtype=float)
-	out   = np.zeros_like(t)
-	valid = t > 0
-	out[valid] = A * np.exp(-(np.log(t[valid] / t_peak))**2 / (2 * sigma**2))
-	return out
-
-
-def _fit_primary_plume(flux_vals, age_hrs, residual_tol=2.0):
-	"""
-	Identify the primary NO2 plume by fitting a log-normal pulse to
-	(age, flux) and iteratively rejecting outliers with large residuals.
-
-	This is robust to:
-	  - gaps in tdump_id (fit is global, not point-by-point)
-	  - spurious large flux from a separate downwind source (outlier rejection)
-	  - noise on individual transects (least-squares fit averages over all)
-
-	Parameters
-	----------
-	flux_vals	 : np.ndarray  shape (N,) QC-screened flux, ascending age order
-	age_hrs		 : np.ndarray  shape (N,) transport age [hours], same order
-	residual_tol : float	   points with |residual| > residual_tol * MAD of
-							   residuals are flagged as outside primary plume;
-							   lower = stricter outlier rejection (default 2.0)
-
-	Returns
-	-------
-	in_primary	 : np.ndarray  bool mask, shape (N,)  True = primary plume
-	t_peak_fit	 : float	   fitted peak age [hours]	(PSS point estimate)
-	fit_ok		 : bool		   False if fitting failed (caller falls back to argmax)
-	"""
-	age  = np.abs(age_hrs).astype(float)
-	flux = flux_vals.astype(float)
-	n	 = len(flux)
-
-	# Need at least 4 points to fit 3 parameters with a degree of freedom
-	if n < 4:
-		return np.ones(n, dtype=bool), age[np.argmax(flux)], False
-
-	# Initial parameter guess
-	i0		= np.argmax(flux)
-	A0		= flux[i0]
-	t_peak0 = max(age[i0], 0.1)
-	sigma0	= 0.5	# log-normal width; 0.5 covers ~1 decade in age
-
-	try:
-		popt, _ = curve_fit(
-			_lognormal_pulse, age, flux,
-			p0=[A0, t_peak0, sigma0],
-			bounds=([0, 0.01, 0.05], [A0 * 5, age.max() * 1.5, 3.0]),
-			maxfev=5000,
-		)
-		A_fit, t_peak_fit, sigma_fit = popt
-	except RuntimeError:
-		return np.ones(n, dtype=bool), age[np.argmax(flux)], False
-
-	# Iterative outlier rejection: flag points whose residual exceeds
-	# residual_tol × MAD (median absolute deviation) of all residuals.
-	# Iterate once — a single pass is usually sufficient because outliers
-	# from a separate source tend to be coherently large.
-	residuals	= flux - _lognormal_pulse(age, *popt)
-	mad			= np.median(np.abs(residuals - np.median(residuals)))
-	in_primary	= np.abs(residuals) <= residual_tol * (mad + 1e-9)
-
-	# Refit on inliers only if any points were rejected
-	if not np.all(in_primary) and in_primary.sum() >= 4:
-		try:
-			popt2, _ = curve_fit(
-				_lognormal_pulse, age[in_primary], flux[in_primary],
-				p0=popt,
-				bounds=([0, 0.01, 0.05], [A_fit * 5, age.max() * 1.5, 3.0]),
-				maxfev=5000,
-			)
-			A_fit, t_peak_fit, sigma_fit = popt2
-			residuals  = flux - _lognormal_pulse(age, *popt2)
-			mad		   = np.median(np.abs(residuals - np.median(residuals)))
-			in_primary = np.abs(residuals) <= residual_tol * (mad + 1e-9)
-		except RuntimeError:
-			pass   # keep first-pass result
-
-	return in_primary, float(t_peak_fit), True
-
 def step2_find_pss_point(trop_csf, suffix="_O",
-						 flux_col_template="flux_no2{s}",
-						 residual_tol=2.0,
-						 rsq_min=0.7, d_gap_max=50.0, nobs_min=5):	 # fallback only
-
+						 rsq_min=0.7, d_gap_max=50.0, nobs_min=5,
+						 flux_col_template="flux_no2{s}"):
 	"""
 	Step 2: Screen flux values by quality flags and locate the trajectory
 	point where flux_no2 peaks	→  this is the PSS point.
@@ -464,7 +378,7 @@ def step2_find_pss_point(trop_csf, suffix="_O",
 	rsq_col  = f"rsq_detrend{suffix}"
 	gap_col  = f"d_gap{suffix}"
 	nobs_col = f"nobs{suffix}"
-	"""
+
 	df = trop_csf.copy()
 
 	# Apply quality screens (only where columns exist)
@@ -474,53 +388,23 @@ def step2_find_pss_point(trop_csf, suffix="_O",
 	if nobs_col in df.columns: mask &= df[nobs_col].fillna(0)	 >= nobs_min
 	if flux_col in df.columns: mask &= df[flux_col].notna() & (df[flux_col] > 0)
 
-	trop_csf_qc = df.loc[mask].sort_values("tdump_id").reset_index(drop=True)
-
-	if trop_csf_qc.empty or flux_col not in trop_csf_qc.columns:
-		print(f"  [step2] No valid flux rows after QC (suffix={suffix})")
-		return trop_csf_qc, pd.Series(dtype=float), np.nan
-	"""
-	qf_col = f"QF_gauss_abs{suffix}"
-
-	df = trop_csf.copy()
-	mask = df[flux_col].notna() & (df[flux_col] > 0)
-	mask &= df[qf_col] == 0
-
-	trop_csf_qc = df.loc[mask].sort_values("tdump_id").reset_index(drop=True)
+	trop_csf_qc = df.loc[mask].reset_index(drop=True)
 
 	if trop_csf_qc.empty or flux_col not in trop_csf_qc.columns:
 		print(f"  [step2] No valid flux rows after QC (suffix={suffix})")
 		return trop_csf_qc, pd.Series(dtype=float), np.nan
 
-	age_col = f"age_hours{suffix}"
-	in_primary, t_peak_fit, fit_ok = _fit_primary_plume(
-		trop_csf_qc[flux_col].values,
-		trop_csf_qc[age_col].values,
-		residual_tol=residual_tol,
-	)
-	trop_csf_qc["step2_in_primary_plume"] = in_primary
-	n_excl = (~in_primary).sum()
-	if n_excl > 0:
-		print(f"  [step2] Outlier rejection: excluded {n_excl}/{len(trop_csf_qc)} rows "
-			  f"outside primary plume fit  (fit_ok={fit_ok})")
-
-	primary = trop_csf_qc.loc[in_primary]
-
-	# PSS point: data row closest to fitted t_peak (or argmax if fit failed)
-	if fit_ok:
-		age_abs		= np.abs(primary[age_col].values)
-		closest_idx = primary.index[np.argmin(np.abs(age_abs - t_peak_fit))]
-		pss_row		= trop_csf_qc.loc[closest_idx]
-	else:
-		pss_row = primary.loc[primary[flux_col].idxmax()]
-
+	# Find tdump_id where flux_no2 peaks
+	peak_idx	 = trop_csf_qc[flux_col].idxmax()
+	pss_row		 = trop_csf_qc.loc[peak_idx]
 	pss_tdump_id = pss_row.get("tdump_id", np.nan)
+
 	print(f"  [step2] PSS point: tdump_id={pss_tdump_id}  "
 		  f"flux_no2={pss_row[flux_col]:.4f} tNO2/hr  "
-		  f"age_hrs={pss_row.get(age_col, np.nan):.2f}	"
-		  f"t_peak_fit={t_peak_fit:.2f} hr	fit_ok={fit_ok}")
+		  f"age_hrs={pss_row.get(f'age_hours{suffix}', np.nan):.2f}")
 
 	return trop_csf_qc, pss_row, pss_tdump_id
+
 
 # =============================================================================
 # STEP 3 — Convert NO2 flux → NOx flux at the PSS point
@@ -583,8 +467,10 @@ def _get_oh_column(lat, lon, timestamp_utc, d_geoscf):
 	average, integrate over DELP from met_inst_1hr_glo_L1440x721_v72.
 	"""
 	ts	   = pd.Timestamp(timestamp_utc)
-	f_oxi  = _geoscf_filepath("oxi_inst_1hr_glo_L1440x721_v72", ts, d_geoscf, mode="ana")
-	f_met  = _geoscf_filepath("met_inst_1hr_glo_L1440x721_v72", ts, d_geoscf, mode="ana")
+	f_oxi  = _geoscf_filepath("oxi_inst_1hr_glo_L1440x721_v72", ts, d_geoscf,
+							   mode="ana")
+	f_met  = _geoscf_filepath("met_inst_1hr_glo_L1440x721_v72", ts, d_geoscf,
+							   mode="ana")
 
 	oh_col	 = _geoscf_interp_column(f_oxi, "OH",	lat, lon)	# (72,) mol mol-1
 	delp_col = _geoscf_interp_column(f_met, "DELP", lat, lon)	# (72,) Pa
@@ -695,80 +581,89 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS,
 		"age_at_PSS_s":    age_pss_s,
 		"option":		   option,
 		"oh_nd":		   np.nan,
-		"flux_nox_fit":    None,   # Series (same index as trop_csf_qc) set below
 	}
 
 	if np.isnan(flux_nox_PSS) or np.isnan(age_pss_s):
 		print("  [step4] Missing flux_nox_PSS or age_at_PSS — skipping.")
 		return result
 
-	# Helper: evaluate fitted curve at every QC row age and store as Series
-	def _eval_fit_curve(k, t_ref_s=age_pss_s):
-		"""flux_nox(t) = flux_nox_PSS * exp(-k * (t - t_ref))  evaluated per row."""
-		t_s = np.abs(trop_csf_qc[age_col].values) * 3600.0
-		return pd.Series(flux_nox_PSS * np.exp(-k * (t_s - t_ref_s)),
-						 index=trop_csf_qc.index)
-
 	# ------------------------------------------------------------------ #
-	# Option A: empirical exponential fit to post-PSS flux decline		  #
+	# Option A: empirical exponential fit to post-PSS flux				 #
 	# ------------------------------------------------------------------ #
 	if option == "A":
 		pss_tid = pss_row.get("tdump_id", -1)
-		post = trop_csf_qc.loc[trop_csf_qc["tdump_id"] > pss_tid].copy()
 
-		if flux_col not in post.columns:
+		# Post-PSS rows: tdump_id > pss_tid (further downwind / older air)
+		post = trop_csf_qc.loc[
+			trop_csf_qc["tdump_id"] > pss_tid
+		].copy()
+
+		if flux_col in post.columns:
+			post["flux_nox"] = post[flux_col] * post.get("pss_ratio", 1.0)
+		else:
 			print("  [step4-A] No post-PSS flux data for fit.")
 			return result
 
-		post["flux_nox"] = post[flux_col] * post.get("pss_ratio", 1.0)
-		post = post.dropna(subset=[age_col, "flux_nox"]).loc[lambda d: d["flux_nox"] > 0]
+		post = post.dropna(subset=[age_col, "flux_nox"])
+		post = post.loc[post["flux_nox"] > 0]
 
 		if len(post) < 3:
-			print(f"  [step4-A] Insufficient post-PSS points (n={len(post)}).")
+			print("  [step4-A] Insufficient post-PSS points for fit "
+				  f"(n={len(post)}).")
 			return result
 
-		# Fit  f_rel(t_rel) = exp(-k * t_rel)  where t_rel = t - age_pss_s
-		t_rel = np.abs(post[age_col].values) * 3600.0 - age_pss_s
-		f_rel = post["flux_nox"].values / flux_nox_PSS
+		t_arr = np.abs(post[age_col].values) * 3600.0	# [s]
+		f_arr = post["flux_nox"].values
+
+		# Normalise by flux_nox_PSS so we fit decay from 1 at t=age_pss_s
+		t_rel = t_arr - age_pss_s
+		f_rel = f_arr / flux_nox_PSS
+
 		try:
-			popt, _ = curve_fit(lambda t, k: np.exp(-k * t), t_rel, f_rel,
-								p0=[1e-4], bounds=([0], [1e-1]), maxfev=10_000)
+			def _exp_decay(t, k): return np.exp(-k * t)
+			popt, _ = curve_fit(_exp_decay, t_rel, f_rel,
+								p0=[1e-4], bounds=([0], [1e-1]),
+								maxfev=10_000)
 			k_eff = float(popt[0])
 		except RuntimeError:
 			print("  [step4-A] Exponential fit failed.")
 			return result
 
 		flux_nox_source = flux_nox_PSS * np.exp(k_eff * age_pss_s)
-		result.update({"flux_nox_source": flux_nox_source,
-					   "k_eff":			  k_eff,
-					   "flux_nox_fit":	  _eval_fit_curve(k_eff)})
+		result.update({
+			"flux_nox_source": flux_nox_source,
+			"k_eff":		   k_eff,
+		})
 		print(f"  [step4-A] k_eff={k_eff:.2e} s-1  "
 			  f"age_PSS={age_pss_s/3600:.2f} hr  "
 			  f"flux_nox_source={flux_nox_source:.4f} tNOx/hr")
 
 	# ------------------------------------------------------------------ #
-	# Option B: analytical — k_loss from GEOS-CF [OH]					 #
+	# Option B: analytical — k_loss from GEOS-CF [OH]					#
 	# ------------------------------------------------------------------ #
 	elif option == "B":
 		lat  = float(pss_row.get(f"lat_a3{suffix}", np.nan))
 		lon  = float(pss_row.get(f"lon_a3{suffix}", np.nan))
 		time = pss_row.get(f"time_tag{suffix}", pd.NaT)
-		T_K  = float(pss_row.get("T_K_geoscf", np.nan))
+		T_K  = float(pss_row.get(f"T_K_geoscf", np.nan))
 
 		if any(pd.isna(v) for v in [lat, lon]):
 			print("  [step4-B] Missing lat/lon for OH look-up.")
 			return result
 
-		oh_nd = _get_oh_column(lat, lon, time, d_geoscf)
+		oh_nd  = _get_oh_column(lat, lon, time, d_geoscf)
 		if np.isnan(T_K):
+			# Fall back to tdump temperature
 			T_K = float(pss_row.get(f"temp{suffix}", 298.0))
 
-		k_loss			= _k_loss_nox(T_K, oh_nd)
+		k_loss = _k_loss_nox(T_K, oh_nd)
 		flux_nox_source = flux_nox_PSS * np.exp(k_loss * age_pss_s)
-		result.update({"flux_nox_source": flux_nox_source,
-					   "k_loss":		  k_loss,
-					   "oh_nd":			  oh_nd,
-					   "flux_nox_fit":	  _eval_fit_curve(k_loss)})
+
+		result.update({
+			"flux_nox_source": flux_nox_source,
+			"k_loss":		   k_loss,
+			"oh_nd":		   oh_nd,
+		})
 		print(f"  [step4-B] [OH]={oh_nd:.2e} molec/cm3	"
 			  f"k_loss={k_loss:.2e} s-1  "
 			  f"age_PSS={age_pss_s/3600:.2f} hr  "
@@ -778,66 +673,64 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS,
 
 
 # =============================================================================
-# MAIN CALLER — drop into _csf_prcs() after step 2i (CSV saved)
+# MASTER CALLER — drop into _csf_prcs() after step 2i (CSV saved)
 # =============================================================================
 
-def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a="B", residual_tol=2.0):
+def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a="B"):
 	"""
-	Orchestrates Steps 1–5.  Call this inside _csf_prcs() after trop_csf.to_csv(...)
+	Orchestrates Steps 1–5.  Call this inside _csf_prcs() immediately after trop_csf.to_csv(...) 
 
-		trop_csf, nox_result = run_nox_workflow(
-			trop_csf, true_tdump, CT.d_geoscf, suffix="_O", option_b_or_a="B"
+		nox_result = run_nox_workflow(
+			trop_csf   = trop_csf,
+			true_tdump = true_tdump,
+			d_geoscf   = CT.d_geoscf,
+			suffix	   = "_O",
+			option_b_or_a = "B",	# "A" for empirical, "B" for analytical
 		)
+		# nox_result is a flat dict; optionally append to a summary DataFrame.
 
-	trop_csf gains per-row columns from Step 1 (pss_ratio, jno2, k_no_o3,
-	o3_molmol, o3_nd, T_K_geoscf, cosz, P_Pa) and a QC/PSS flag column from
-	Step 2 (step2_qc_pass, step2_is_pss_point).  All scalar step results
-	(Steps 2–5) are returned in nox_result only — not broadcast as columns.
+	Parameters
+	----------
+	trop_csf	  : pd.DataFrame  merged _H/_O CSF result
+	true_tdump	  : pd.DataFrame  optimised trajectory
+	d_geoscf	  : str			  CT.d_geoscf
+	suffix		  : str			  "_O" (optimised) or "_H" (HYSPLIT)
+	option_b_or_a : str			  "A" or "B" for step 4
 
 	Returns
 	-------
-	trop_csf   : pd.DataFrame  with Step 1–2 per-row columns appended
-	nox_result : dict		   scalars from all five steps; keys:
-					 status, pss_tdump_id, pss_ratio, flux_nox_PSS,
-					 flux_nox_source, k_loss, k_eff, age_at_PSS_s, oh_nd, option
+	dict  aggregated results from all five steps
 	"""
 	print("  [NOx workflow] Starting 5-step PSS back-calculation ...")
 
-	# Step 1 — per-row PSS fields (adds columns directly to trop_csf)
+	# Step 1
 	trop_csf = step1_pss_ratio(trop_csf, true_tdump, d_geoscf, suffix=suffix)
 
-	# Step 2 — QC screen + locate PSS point
+	# Step 2
 	trop_csf_qc, pss_row, pss_tdump_id = step2_find_pss_point(trop_csf, suffix=suffix)
-	trop_csf["step2_qc_pass"]	  = trop_csf.index.isin(trop_csf_qc.index)
-	trop_csf["step2_is_pss_point"] = trop_csf["tdump_id"] == pss_tdump_id
 
 	if pss_row.empty or np.isnan(pss_tdump_id):
 		print("  [NOx workflow] No valid PSS point found — aborting.")
-		return trop_csf, {"status": "no_pss_point"}
+		return {"status": "no_pss_point"}
 
-	# Step 3 — NO2 flux → NOx flux at PSS (scalars only)
+	# Step 3
 	flux_nox_PSS, pss_ratio = step3_no2_to_nox_flux(pss_row, suffix=suffix)
+
 	if np.isnan(flux_nox_PSS):
 		print("  [NOx workflow] Step 3 failed — aborting.")
-		return trop_csf, {"status": "step3_failed"}
+		return {"status": "step3_failed"}
 
-	# Step 4 — decay correction back to t=0
+	# Step 4
 	decay = step4_decay_correction(
 		trop_csf_qc, pss_row, flux_nox_PSS,
 		d_geoscf, suffix=suffix, option=option_b_or_a)
 
-	# flux_nox_fit is per-row (QC rows only) → write into trop_csf column
-	trop_csf["flux_nox_fit"] = np.nan
-	if decay["flux_nox_fit"] is not None:
-		trop_csf.loc[decay["flux_nox_fit"].index, "flux_nox_fit"] = decay["flux_nox_fit"].values
-
-	# Step 5 — aggregate scalar nox_result (flux_nox_fit excluded; it lives in trop_csf)
-	nox_result = {
+	# Aggregate
+	result = {
 		"status":		   "ok",
 		"pss_tdump_id":    pss_tdump_id,
 		"pss_ratio":	   pss_ratio,
 		"flux_nox_PSS":    flux_nox_PSS,
-		**{k: v for k, v in decay.items() if k != "flux_nox_fit"},
+		**decay,
 	}
-	print("  [NOx workflow] Complete.")
-	return trop_csf, nox_result
+	return result

@@ -25,12 +25,12 @@ FACILITIES = {
 }
 
 START	   = date(2019, 1, 1)
-END		   = date(2019, 3, 31)
+END		   = date(2025, 12, 31)
 OUTPUT_DIR = Path(CT.d_cems)
 URL		   = 'https://api.epa.gov/easey/streaming-services/emissions/apportioned/hourly'
 
 DELAY		= 1.0	# seconds between every request
-RETRY_WAIT	= 30	# seconds to wait after a 429
+RETRY_WAIT	= 20	# seconds to wait after a 429
 MAX_RETRIES = 5		# max retries per request
 # ─────────────────────────────────────────────────────────────────────────────
 
