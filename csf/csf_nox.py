@@ -62,7 +62,6 @@ _JNO2_OVERHEAD = 8.5e-3    # [s-1]
 # =============================================================================
 # GEOS-CF FILE HELPERS
 # =============================================================================
-
 def _geoscf_filepath(collection, timestamp_utc, d_geoscf, mode="ana"):
 	"""
 	Build the full path to a GEOS-CF v2 NetCDF-4 file.
@@ -81,10 +80,31 @@ def _geoscf_filepath(collection, timestamp_utc, d_geoscf, mode="ana"):
 	hh	  = ts.floor("h").strftime("%H")
 	mm	  = "30" if "tavg" in collection else "00"
 	stamp = f"{ts.strftime('%Y%m%d')}_{hh}{mm}z"
-	fname = f"GEOS.cf.{mode}.{collection}.{stamp}*nc4" # * denotes R0: the original version of the file, R1: the first revision of the file, ...
-	ddir  = os.path.join(d_geoscf, "NRTv2", "pub", mode, f"Y{ts.strftime('%Y')}", f"M{ts.strftime('%m')}", f"D{ts.strftime('%d')}")
+
+	# Select directory tree and filename format based on data period:
+	#	Jan 2023 – Oct 2024  → hindcast archive
+	#	Aug 2025 – present	 → NRTv2
+	#	anything in between  → not available, return ""
+	_HINDCAST_START = pd.Timestamp("2023-01-01")
+	_HINDCAST_END	= pd.Timestamp("2024-10-31 23:59:59")
+	_NRT_START		= pd.Timestamp("2025-08-01")
+
+	ymd = f"Y{ts.strftime('%Y')}/M{ts.strftime('%m')}/D{ts.strftime('%d')}"
+
+	if _HINDCAST_START <= ts <= _HINDCAST_END:
+		# e.g. CF2_hindcast.chm_tavg_1hr_glo_L1440x721_slv.20230101_1030z.R0.nc4
+		fname = f"CF2_hindcast.{collection}.{stamp}*nc4"
+		ddir  = os.path.join(d_geoscf, "hindcast", "pub", mode, ymd)
+	elif ts >= _NRT_START:
+		# e.g. GEOS.cf.ana.chm_tavg_1hr_glo_L1440x721_slv.20250801_1030z.R0.nc4
+		fname = f"GEOS.cf.{mode}.{collection}.{stamp}*nc4"
+		ddir  = os.path.join(d_geoscf, "NRTv2", "pub", mode, ymd)
+	else:
+		return ""  # gap period: no data available
+
 	df = glob.glob(os.path.join(ddir, fname))
 	return df[0] if df else ""
+
 
 def _geoscf_interp_point(fpath, varname, lat, lon, lev_idx=0):
 	"""

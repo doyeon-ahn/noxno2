@@ -25,7 +25,9 @@ CFG = {
 	"CSF_PRCS_VER":		CT.PRCS_VER["csf"],
 	"TARGET_INFO":		CT.df_target,
 	"SATE_INFO":		["trop", CT.DATA_VER["trop"], CT.PRCS_VER["trop"],
-						 "2025-09-03", "2025-09-04",   # date range [start, end]
+						 #"2023-01-01", "2024-10-31",   # date range [start, end]
+						 "2024-02-20", "2024-02-21",   # date range [start, end]
+						 #"2019-01-01", "2025-12-31",   # date range [start, end]
 						 "qf_good", "prcsd"],
 	"HYSTRAJ_RUN_VER":	CT.PRCS_VER["hystraj"],
 
@@ -34,7 +36,7 @@ CFG = {
 	# ------------------------------------------------------------------
 	"TARGET_IDS_ALL":	["6705","6076","8102","6165","6481","6002",
 						 "2103","6146","2832","2823","2167","2168"],
-	"TARGET_IDS_RUN":	["6076"],			# subset to actually process
+	"TARGET_IDS_RUN":	["2103","6076"],			# subset to actually process
 
 	# ------------------------------------------------------------------
 	# Satellite pixel QA
@@ -92,7 +94,7 @@ CFG = {
 	"FLUX_UNIT":		"[tNO2/hr]",
 	"o_calc_nox":		False,			  # legacy NOx lifetime fit
 	"o_plot":			True,			  # produce PNG plots
-	"o_plot_every":		1,				  # plot every N overpasses
+	"o_plot_every":		100,			  # plot every N overpasses
 	"o_plot_wddiff":	False,			  # overlay wind-direction comparison
 	"snapshot":			True,			  # save code snapshot on completion
 
@@ -540,8 +542,7 @@ def _csf_prcs(CFG, target):
 					csf_true  = _calc_qf_gauss(csf_true, suffix="_O")
 					trop_csf  = trop_csf.merge(csf_true, on="tdump_id", how="left")
 
-			# 2i. Save CSV + run NOx workflow
-			trop_csf.to_csv(dout_csv + fout + ".csv", index=False)
+			# 2i. Run NOx workflow, save to csv
 			trop_csf, nox_result = run_nox_workflow(
 				trop_csf	  = trop_csf,
 				true_tdump	  = true_tdump,
@@ -550,6 +551,7 @@ def _csf_prcs(CFG, target):
 				option_b_or_a = CFG["NOX_OPTION"],
 				residual_tol  = CFG["NOX_RESIDUAL_TOL"],
 			)
+			trop_csf.to_csv(dout_csv + fout + ".csv", index=False)
 
 			# 2j-k. CEMS + plot
 			do_plot = (CFG["o_plot"] and i_sate % CFG["o_plot_every"] == 0
