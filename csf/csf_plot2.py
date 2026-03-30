@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import contextily as ctx
 import numpy as np
 import pandas as pd
+import IPython
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import sys
 sys.path.insert(0, "..")
@@ -56,7 +57,8 @@ def _scatter_qf(ax, data_csf, age_col, val_col, color, marker="o", label=None):
 # PANEL 1 — basemap + satellite pixels + trajectory + transects
 # =============================================================================
 
-def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=None):
+def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled,
+			  data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=None):
 
 	ax.set_xlim([target["lon"] - 0.50, target["lon"] + 0.50])
 	ax.set_ylim([target["lat"] - 0.50, target["lat"] + 0.50])
@@ -71,6 +73,7 @@ def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H
 
 	# Colorbar
 	voi = style["voi"]
+	#cax = make_axes_locatable(ax).append_axes("bottom", size="2%", pad=0.03)
 	if CFG["SATE_INFO"][0] == "trop":
 		data = data.loc[data["qa_value"] > 0.5]
 	lo = data[voi].sort_values().iloc[int(len(data) * style["pct"][0])]
@@ -101,26 +104,22 @@ def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H
 
 	# Transect segments
 	for tid in data_sampled["tdump_id"].unique():
-		row		 = data_csf_H.loc[data_csf_H["tdump_id"] == tid].iloc[0]
 		seg		 = data_sampled.loc[data_sampled["tdump_id"] == tid]
+		seg_true = data_true_sampled.loc[data_true_sampled["tdump_id"] == tid]
+		row		 = data_csf_H.loc[data_csf_H["tdump_id"] == tid].iloc[0]
 		fwhm	 = seg.loc[(seg["dist_ortho"] >= row["a3"] - row["a4"]/2) &
 						   (seg["dist_ortho"] <= row["a3"] + row["a4"]/2)]
-		ax.scatter(row["lon_a3"], row["lat_a3"], edgecolor="red", marker="o", s=3.0, lw=0.7, facecolor="none")
+		fwhm_t	 = seg_true.loc[(seg_true["dist_ortho"] >= row["a3_O"] - row["a4_O"]/2) &
+								(seg_true["dist_ortho"] <= row["a3_O"] + row["a4_O"]/2)]
 		ax.plot(seg["lon_ortho"],	 seg["lat_ortho"],	  linestyle="dashed", color=style["clr_ortho"], lw=0.40)
 		ax.plot(fwhm["lon_ortho"],	 fwhm["lat_ortho"],   linestyle="solid",  color="red",		  lw=0.40)
-
-		if len(data_true_sampled) > 1:
-			seg_true = data_true_sampled.loc[data_true_sampled["tdump_id"] == tid]
-			fwhm_t	 = seg_true.loc[(seg_true["dist_ortho"] >= row["a3_O"] - row["a4_O"]/2) &
-									(seg_true["dist_ortho"] <= row["a3_O"] + row["a4_O"]/2)]
-
-			ax.plot(fwhm_t["lon_ortho"], fwhm_t["lat_ortho"], linestyle="solid",  color="dodgerblue", lw=0.40, zorder=10)
-
+		ax.plot(fwhm_t["lon_ortho"], fwhm_t["lat_ortho"], linestyle="solid",  color="dodgerblue", lw=0.40, zorder=10)
+		ax.scatter(row["lon_a3"], row["lat_a3"], edgecolor="red", marker="o", s=3.0, lw=0.7, facecolor="none")
 
 	sat_label = "TROPOMI" if CFG["SATE_INFO"][0] == "trop" else "OCO-3"
 	ax.text(0.04, 0.96,
 			f"{sat_label}: {pd.to_datetime(sate['time_utc']).strftime('%Y-%m-%d %H:%M')} (UTC)",
-			va="center", transform=ax.transAxes, color=style["clr_text"], fontsize=6)
+			va="center", transform=ax.transAxes, color=style["clr_text"], fontsize=7)
 
 
 # =============================================================================
@@ -207,8 +206,9 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 
 	# --- CSF fluxes (HYSPLIT + Optimized) ---
 	_scatter_qf(ax, data_csf, age_H, flux_var + "_H", "dodgerblue", label="CSF (HYSPLIT)")
-	if flux_var + "_O" in data_csf.columns:
-		_scatter_qf(ax, data_csf, age_O, flux_var + "_O", "limegreen", label="CSF (Optimized)")
+	#if flux_var + "_O" in data_csf.columns:
+	#	_scatter_qf(ax, data_csf, age_O, flux_var + "_O", "limegreen", label="CSF (Optimized)")
+	_scatter_qf(ax, data_csf, age_H, 'flux_nox' , "blue", label="CSF (HYSPLIT), NOx")
 
 	# --- Secondary x-axis: transport distance [km] ---
 	age_km_col = "age_km_H" if "age_km_H" in data_csf.columns else "age_km"
@@ -225,9 +225,11 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 	# --- PSS ratio per row (Step 1, from trop_csf) ---
 	if trop_csf is not None and "pss_ratio" in trop_csf.columns:
 		ax_pss = ax.twinx()
-		ax_pss.scatter(trop_csf[age_O], trop_csf["pss_ratio"], marker="^", color="purple", s=12, label="NOx/NO2 (PSS)", zorder=4)
+		ax_pss.scatter(trop_csf[age_O], trop_csf["pss_ratio"],
+					   marker="^", color="purple", s=12, zorder=0)
 		ax_pss.set_ylabel("NOx/NO2 PSS ratio", color="purple")
 		ax_pss.tick_params(axis="y", colors="purple")
+		ax_pss.legend(fontsize=6, loc="upper left")
 
 	# --- Step 4: fitted exponential decay curve (per-row, from trop_csf) ---
 	if trop_csf is not None and "flux_nox_fit" in trop_csf.columns:
@@ -291,9 +293,9 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 # MAIN PLOT FUNCTION
 # =============================================================================
 
-def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump,
+def _plot_csf(CFG, target, data, data_sampled, data_true_sampled, data_csf, tdump,
 			  sate, flux_unit, o_plot_wddiff, dfout,
-			  cems_nox=None, true_tdump=None, trop_csf=None, nox_result=None, data_true_sampled=[None]):
+			  cems_nox=None, true_tdump=None, trop_csf=None, nox_result=None):
 	"""
 	Compose the three-panel CSF figure and save to dfout + '.png'.
 
@@ -318,9 +320,10 @@ def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump,
 	# Strip _H suffix for map/Gaussian panels (they use plain column names)
 	data_csf_H = data_csf.rename(columns=lambda c: c[:-2] if c.endswith("_H") else c)
 
-	_plot_map(ax_map, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=true_tdump)
+	_plot_map(ax_map, CFG, target, data, data_sampled, data_true_sampled,
+			  data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=true_tdump)
 	_plot_gaussian_panels(ax, pp_list, CFG, data_csf_H, data_sampled, style)
 	_plot_flux_vs_time(ax_flux, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_unit, style)
 
-	fig.savefig(dfout + ".png", dpi=400)
+	fig.savefig(dfout + ".png", dpi=200)
 	plt.close("all")

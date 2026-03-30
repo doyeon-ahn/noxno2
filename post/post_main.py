@@ -1,7 +1,16 @@
 # =============================================================================
 # post_main.py	 Post-processing of CSF output	 (compatible with csf_prcs v20260324)
+#
+# Goal:
+#	1. Read all per-facility csf_*.csv files (_read_csf)
+#	2. For every individual CSF row (one Gaussian fit at one transport step),
+#	   find the CEMS NOx record that corresponds to the time that air parcel
+#	   left the stack:
+#		   t_emission = t_overpass - age_hours_H
+#	   and attach the nearest hourly CEMS value to that row.
+#	3. Plot NO2 CSF flux vs. CEMS NOx emission rate, coloured by transport time.
 # =============================================================================
-import os, sys, glob, fnmatch
+import os, sys, fnmatch
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -9,111 +18,77 @@ import pyarrow.csv as pa_csv
 from tqdm import tqdm
 from timezonefinder import TimezoneFinder
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 sys.path.insert(0, "..")
-import CT, FN
-from post_plot_vsCEMS import _plot_csf_scatter
+import CT
+from post_plot_vsCEMS import plot_no2_vs_cems
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 CFG = {
-	'POST_PRCS_VER':	CT.PRCS_VER['post'],
-	'CSF_PRCS_VER':		CT.PRCS_VER['csf'],
-	'TARGET_INFO':		CT.df_target,
+	'CSF_PRCS_VER':  CT.PRCS_VER['csf'],
+	'POST_PRCS_VER': CT.PRCS_VER['post'],
+	'TARGET_INFO':	 CT.df_target,
 
-	# ---- QF applied in post (column-level, abs only) -------------------------
-	# These filter on the suffixed _H columns that are already in the CSV.
-	# nobs / u_std / v_std / rsq_detrend refer to the _H suffix variants.
-	# QF_gauss_abs_H == 0 is the primary gate; the list below adds extra cuts.
-	'o_trop': {
-		'o_read': True,
-		'type':   'csv',
-		'QF': [
-			('nobs_H',			25.,	9999.,	'abs'),
-			('u_std_H',			-9999., 1.0,	'abs'),
-			('v_std_H',			-9999., 1.0,	'abs'),
-			('rsq_detrend_H',	0.5,	9999.,	'abs'),
-			#('t_pss',			-9999., 2.0,	'abs'),   # NOx lifetime QF
-			#('nox_lifetime',	3.0,	8.0,	'abs'),
-		],
-	},
-	'o_cems':			{'o_read': True},
-	'CEMS_LOOKBACK_HRS': 6,
+	# Facility IDs to process
+	'TARGET_IDS': ['2167'], #'2103', '6076'],
 
-	# transport bins in minutes (for scatter / histogram helpers)
-	'transport_bins':	[(0,30),(30,60),(60,90),(90,120),(120,150),(150,180),(180,210),(210,240)],
+	# CSF column names (suffix _H = HYSPLIT trajectory)
+	#'FLUX_COL': 'flux_no2_H',
+	'FLUX_COL': 'flux_nox_fit',
+	'AGE_COL':	'age_hours_H',
+	'QF_COL':	'QF_gauss_abs_H',
 
-	# Flux column to use for plotting; matches the suffixed CSF output
-	'flux_col':			'flux_no2_H',	# or 'flux_no2_O' for optimised trajectory
+	# Additional quality filters applied after the primary QF gate.
+	# Each tuple: (column, vmin, vmax)
+	'QF_EXTRA': [
+		('nobs_H',		   25.,   9999.),
+		('u_std_H',		 -9999.,	1.0),
+		('v_std_H',		 -9999.,	1.0),
+		('rsq_detrend_H',  0.5,   9999.),
+	],
 
-	'snapshot':			True,
+	# CEMS matching: max allowed |t_emission - cems_hour| in hours.
+	# CEMS data is hourly so 0.5 h always finds the nearest record exactly;
+	# raise to 1.0 h if you want to keep rows where CEMS data has gaps.
+	'CEMS_MATCH_TOL_HRS': 0.5,
 }
 
-# ---- Target table -----------------------------------------------------------
+# =============================================================================
+# TARGET TABLE
+# =============================================================================
 target = pd.read_csv(CFG['TARGET_INFO'])
 target['facilityId'] = target['facilityId'].astype(str)
-target = target.loc[target['facilityId'].isin(['2103', '6076'])].reset_index(drop=True)
+target = target.loc[target['facilityId'].isin(CFG['TARGET_IDS'])].reset_index(drop=True)
 
 
 # =============================================================================
-# QF FILTER
+# STEP 1 — READ CSF CSVs
 # =============================================================================
-def _prcs_QF(sate, data, QF):
+def _read_csf(target, CFG):
 	"""
-	Apply absolute (and optionally percentile) quality filters.
-	Columns that don't exist in `data` are skipped with a warning.
-	"""
-	data = data.copy()
-	data['QF_abs'] = 0	 # 0 = good
-	data['QF_pct'] = 0
-	for qf in QF:
-		col, vmin, vmax, mode = qf[0], qf[1], qf[2], qf[3]
-		if col not in data.columns:
-			print(f'  [QF] column not found, skipping: {col}')
-			continue
-		print(qf)
-		if mode == 'abs':
-			lBAD = (data[col] < vmin) | (data[col] > vmax)
-			data.loc[lBAD, 'QF_abs'] = 1
-		elif mode == 'pct':
-			scope  = qf[4]
-			cities = data['TargetName'].unique() if scope == 'eachcity' else [slice(None)]
-			for city in cities:
-				subset = (data.loc[city, col]
-						  if isinstance(city, slice)
-						  else data.loc[data['TargetName'] == city, col])
-				_min = np.sort(subset.values)[int(len(subset) * vmin)]
-				_max = np.sort(subset.values)[int(len(subset) * vmax) - 1]
-				bad  = (subset < _min) | (subset > _max)
-				data.loc[bad.index[bad], 'QF_pct'] = 1
-	return data
+	Read all csf_*.csv files for each facility using PyArrow (fast, parallel).
+	Returns a long-form DataFrame; one row = one Gaussian fit at one transport step.
 
-
-# =============================================================================
-# READ CSF CSVs
-# =============================================================================
-def _read_gauss(sate, target, CFG):
+	Columns added:
+		facilityId, facilityName  — provenance
+		source_file				  — CSV filename stem
+		t_overpass				  — UTC timestamp of the TROPOMI overpass
+		age_hours				  — transport time [hrs] (copy of AGE_COL)
+		t_emission				  — t_overpass - age_hours	(when air left stack)
 	"""
-	Read all csf_*.csv files for each facility using PyArrow.
-	Returns a long-form DataFrame.
-
-	Column notes (csf_prcs v20260324):
-	  - age_hours_H / age_hours_O	(suffixed, not bare 'age_hours')
-	  - flux_no2_H	/ flux_no2_O
-	  - QF_gauss_abs_H / QF_gauss_abs_O
-	  - source_file is set to the CSV filename stem (e.g. csf_<file>_<ver>)
-	"""
-	base_din = CT.d_noxno2 + 'd_dat/csf/' + CFG['CSF_PRCS_VER'] + '/'
+	base_dir  = CT.d_noxno2 + 'd_dat/csf/' + CFG['CSF_PRCS_VER'] + '/'
 	drop_cols = {'lon_a3_i', 'lon_a3_f', 'lat_a3_i', 'lat_a3_f'}
+
 	pa_read  = pa_csv.ReadOptions(use_threads=True)
 	pa_parse = pa_csv.ParseOptions(delimiter=',')
 	pa_conv  = pa_csv.ConvertOptions(strings_can_be_null=False)
 
-	# Collect all per-facility CSF files
 	tasks = []
 	for _, row in target.iterrows():
 		tid, tname = row['facilityId'], row['facilityName']
-		tdir = base_din + f'{tid}_{tname}/'.replace(' ', '_')
+		tdir = (base_dir + f'{tid}_{tname}/').replace(' ', '_')
 		try:
 			tasks += [
 				(tid, tname, e.path, e.name)
@@ -123,7 +98,7 @@ def _read_gauss(sate, target, CFG):
 				and '_cems' not in e.name
 			]
 		except FileNotFoundError:
-			print(f'  [WARN] Not found: {tdir}')
+			print(f'  [WARN] Directory not found: {tdir}')
 
 	print(f'  [READ] {len(tasks)} files across {target["facilityId"].nunique()} facilities')
 
@@ -131,7 +106,6 @@ def _read_gauss(sate, target, CFG):
 		try:
 			tbl = pa_csv.read_csv(path, pa_read, pa_parse, pa_conv)
 			tbl = tbl.drop([c for c in drop_cols if c in tbl.schema.names])
-			# Normalise tz-aware timestamp columns → UTC without tz info
 			for j, f in enumerate(tbl.schema):
 				if pa.types.is_timestamp(f.type) and f.type.tz:
 					tbl = tbl.set_column(
@@ -157,190 +131,215 @@ def _read_gauss(sate, target, CFG):
 		]
 
 	if not tables:
-		return pd.DataFrame()
+		raise RuntimeError('No CSF files could be read.')
 
-	out = pa.concat_tables(tables, promote_options='default').to_pandas()
+	df = pa.concat_tables(tables, promote_options='default').to_pandas()
 
-	# --- transport_min: prefer _H suffix, fall back gracefully ---------------
-	age_col = ('age_hours_H' if 'age_hours_H' in out.columns
-			   else 'age_hours_O' if 'age_hours_O' in out.columns
-			   else 'age_hours')
-	out['transport_min'] = pd.to_numeric(out[age_col], errors='coerce') * 60.
+	# --- Parse overpass timestamp from filename ----------------------------
+	# Filename pattern (csf_prcs v20260324):
+	#	csf_S5P_OFFL_L2__NO2____<t_start>_<t_end>_..._<VER>.csv
+	# t_start sits at token index 9 after stripping "csf_" prefix and
+	# "_<VER>" suffix and splitting on "_".
+	ver = CFG['CSF_PRCS_VER']
 
-	# --- overpass time: parsed from source_file stem -------------------------
-	# csf_prcs v20260324 fout = f"csf_{sate_row['file']}_{CFG['CSF_PRCS_VER']}"
-	# sate_row['file'] encodes the overpass datetime in position index 9 when
-	# the original L2 filename is split by '_'.  We extract from the stem.
-	# source_file is the .csv filename, e.g.:
-	#	csf_S5P_OFFL_L2__NO2____20251015T163456_20251015T181626_..._<ver>.csv
-	# The overpass start time sits at token index 9 of the original L2 stem
-	# (tokens 0–8 are "S5P_OFFL_L2__NO2____"), so we strip the leading "csf_"
-	# and trailing "_<ver>" then split.
 	def _parse_overpass(fname):
 		stem = fname.replace('.csv', '')
-		# Remove leading "csf_" and trailing version tag "_<ver>"
-		ver  = CFG['CSF_PRCS_VER']
 		if stem.endswith('_' + ver):
-			stem = stem[: -(len(ver) + 1)]
+			stem = stem[:-(len(ver) + 1)]
 		if stem.startswith('csf_'):
 			stem = stem[4:]
-		parts = stem.split('_')
 		try:
-			return pd.to_datetime(parts[9], format='%Y%m%dT%H%M%S', errors='coerce')
+			return pd.to_datetime(stem.split('_')[9], format='%Y%m%dT%H%M%S', errors='coerce')
 		except IndexError:
 			return pd.NaT
 
-	out['t_overpass'] = out['source_file'].apply(_parse_overpass)
+	df['t_overpass'] = df['source_file'].apply(_parse_overpass)
 
-	pq_path = base_din + f'{sate}_l2_{CFG["CSF_PRCS_VER"]}.parquet'
-	out.to_parquet(pq_path, engine='pyarrow', index=False)
-	print(f'  [READ] {len(out)} rows saved → {pq_path}')
-	return out
+	# --- Emission time per row --------------------------------------------
+	# The air parcel sampled by CSF row i left the stack age_hours_H ago.
+	age_col = CFG['AGE_COL']
+	if age_col in df.columns:
+		df['age_hours'] = pd.to_numeric(df[age_col], errors='coerce')
+	else:
+		print(f'  [WARN] Age column "{age_col}" not found')
+		df['age_hours'] = np.nan
+
+	df['t_emission'] = df['t_overpass'] - pd.to_timedelta(df['age_hours'], unit='h')
+
+	print(f'  [READ] {len(df)} total rows loaded')
+	return df
 
 
 # =============================================================================
-# READ CEMS
+# STEP 2 — QUALITY FILTER
 # =============================================================================
-def _read_cems(target, trop_l2, CFG):
+def _apply_qf(df, CFG):
 	"""
-	Read raw CEMS CSV files and sample rows within the lookback window for
-	each TROPOMI overpass in trop_l2.
-
-	Mirrors the per-overpass logic of csf_prcs._read_cems_nox, applied in
-	bulk across all facilities/overpasses for post-processing.
-
-	Returns (target_with_fac_stats, cems_mean_per_overpass).
+	Apply the primary Gaussian QF gate (QF_gauss_abs_H == 0) and any
+	additional column-level cuts defined in CFG['QF_EXTRA'].
+	Also drops rows with no valid flux value or no valid emission time.
 	"""
-	tf = TimezoneFinder()
+	n0 = len(df)
 
-	# One row per unique overpass (facilityId + source_file)
-	overpasses = (
-		trop_l2[['facilityId', 'source_file', 't_overpass']]
-		.drop_duplicates()
-		.dropna(subset=['t_overpass'])
-		.reset_index(drop=True)
+	# Primary gate
+	qf_col = CFG['QF_COL']
+	if qf_col in df.columns:
+		df = df.loc[df[qf_col] == 0].reset_index(drop=True)
+		print(f'  [QF] {qf_col}==0:			{n0} → {len(df)}')
+	else:
+		print(f'  [QF] "{qf_col}" not found, skipping primary gate')
+
+	# Extra cuts
+	for col, vmin, vmax in CFG['QF_EXTRA']:
+		if col not in df.columns:
+			print(f'  [QF] "{col}" not found, skipping')
+			continue
+		n_before = len(df)
+		vals = pd.to_numeric(df[col], errors='coerce')
+		df	 = df.loc[(vals >= vmin) & (vals <= vmax)].reset_index(drop=True)
+		print(f'  [QF] {col} [{vmin}, {vmax}]: {n_before} → {len(df)}')
+
+	# Must have a positive flux and a valid emission time
+	flux_col = CFG['FLUX_COL']
+	n_before = len(df)
+	df[flux_col] = pd.to_numeric(df[flux_col], errors='coerce')
+	df = df.loc[df[flux_col].notna() & (df[flux_col] > 0)].reset_index(drop=True)
+	df = df.loc[df['t_emission'].notna()].reset_index(drop=True)
+	print(f'  [QF] valid flux & t_emission: {n_before} → {len(df)}')
+
+	return df
+
+
+# =============================================================================
+# STEP 3 — MATCH CEMS TO EACH CSF ROW
+# =============================================================================
+def _load_cems(tid, tname, t_min, t_max, target_row, tf):
+	"""
+	Load CEMS CSV files covering [t_min, t_max], convert local → UTC,
+	sum all units per hour, convert lbs/hr → metric t/hr.
+	Returns DataFrame with columns [tstmp_utc, cems_nox_tph].
+	"""
+	tname_long = f'{tid}_{tname}'.replace(' ', '_')
+	months = pd.date_range(
+		t_min.to_period('M').to_timestamp(),
+		t_max.to_period('M').to_timestamp(),
+		freq='MS',
 	)
+	files = [
+		os.path.join(CT.d_cems, tname_long,
+					 f'{tname_long}_{m.year}_{m.month:02d}.csv')
+		for m in months
+	]
+	files = [f for f in files if os.path.exists(f)]
+	if not files:
+		print(f'  [CEMS] No files for {tname_long}')
+		return pd.DataFrame()
 
-	results = []
+	cems = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+
+	cems['tstmp_local'] = (pd.to_datetime(cems['date'])
+						   + pd.to_timedelta(cems['hour'], unit='h'))
+	tz = tf.timezone_at(lat=target_row['lat'], lng=target_row['lon']) or 'UTC'
+	cems['tstmp_utc'] = (
+		cems['tstmp_local']
+		.dt.tz_localize(tz, ambiguous='NaT', nonexistent='NaT')
+		.dt.tz_convert('UTC')
+		.dt.tz_localize(None)
+	)
+	cems['noxMass'] = pd.to_numeric(cems['noxMass'], errors='coerce')
+
+	hourly = (cems.groupby('tstmp_utc', as_index=False)['noxMass']
+				  .sum()
+				  .rename(columns={'noxMass': 'noxMass_tph'}))
+	hourly['cems_nox_tph'] = hourly['noxMass_tph'] * 0.000453592   # lbs/hr → metric t/hr
+
+	return hourly[['tstmp_utc', 'cems_nox_tph']].dropna().sort_values('tstmp_utc')
+
+
+def _match_cems(df, target, CFG):
+	"""
+	For every CSF row attach the CEMS hourly record whose timestamp is
+	closest to t_emission = t_overpass - age_hours, within CEMS_MATCH_TOL_HRS.
+
+	The physical logic:
+		The satellite measures a NO2 column at transport age τ hours downstream.
+		That air parcel was at the stack at  t_emission = t_overpass - τ.
+		The CEMS record for that hour is the relevant emission rate.
+
+	New columns added to df:
+		cems_nox_tph   — matched CEMS NOx [metric t NOx / hr]
+		cems_t_emit    — CEMS timestamp used for the match
+		cems_dt_hrs    — time offset between t_emission and cems_t_emit [hrs]
+	"""
+	tf	= TimezoneFinder()
+	tol = CFG['CEMS_MATCH_TOL_HRS']
+
+	df = df.copy()
+	df['cems_nox_tph'] = np.nan
+	df['cems_t_emit']  = pd.NaT
+	df['cems_dt_hrs']  = np.nan
+
 	for _, trow in target.iterrows():
-		tid		   = trow['facilityId']
-		tname	   = trow['facilityName']
-		tname_long = f'{tid}_{tname}'.replace(' ', '_')
+		tid   = trow['facilityId']
+		tname = trow['facilityName']
 
-		ops_fac = overpasses.loc[overpasses['facilityId'] == tid, 't_overpass']
-		if ops_fac.empty:
+		fac_mask = df['facilityId'] == tid
+		sub = df.loc[fac_mask]
+		if sub.empty:
 			continue
 
-		t_min  = ops_fac.min() - pd.Timedelta(hours=CFG['CEMS_LOOKBACK_HRS'])
-		t_max  = ops_fac.max()
-		months = pd.date_range(
-			t_min.to_period('M').to_timestamp(),
-			t_max.to_period('M').to_timestamp(),
-			freq='MS',
-		)
-		files = [
-			os.path.join(CT.d_cems, tname_long,
-						 f'{tname_long}_{m.year}_{m.month:02d}.csv')
-			for m in months
-		]
-		files = [f for f in files if os.path.exists(f)]
-		if not files:
-			print(f'  [CEMS] No files found for {tname_long}')
+		# Load CEMS covering the full range of emission times for this facility
+		t_min = sub['t_emission'].min() - pd.Timedelta(hours=tol)
+		t_max = sub['t_emission'].max() + pd.Timedelta(hours=tol)
+		cems = _load_cems(tid, tname, t_min, t_max, trow, tf)
+		if cems.empty:
 			continue
 
-		cems = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+		cems_t	 = cems['tstmp_utc'].values.astype('datetime64[ns]')
+		cems_nox = cems['cems_nox_tph'].values
 
-		# Local → UTC (same logic as csf_prcs._read_cems_nox)
-		cems['tstmp_local'] = (pd.to_datetime(cems['date'])
-							   + pd.to_timedelta(cems['hour'], unit='h'))
-		tz = tf.timezone_at(lat=trow['lat'], lng=trow['lon']) or 'UTC'
-		cems['tstmp_utc'] = (
-			cems['tstmp_local']
-			.dt.tz_localize(tz, ambiguous='NaT', nonexistent='NaT')
-			.dt.tz_convert('UTC')
-			.dt.tz_localize(None)
-		)
-		cems['noxMass'] = pd.to_numeric(cems['noxMass'], errors='coerce')
-
-		# Sum all units per hour
-		cems_hourly = (
-			cems.groupby('tstmp_utc', as_index=False)['noxMass']
-				.sum()
-				.rename(columns={'noxMass': 'noxMass_tph'})
-		)
-		cems_hourly['noxMass_tph_metric'] = cems_hourly['noxMass_tph'] * 0.000453592
-
-		# Sample lookback window per overpass
-		for _, op in overpasses.loc[overpasses['facilityId'] == tid].iterrows():
-			t_end	= op['t_overpass']
-			t_start = t_end - pd.Timedelta(hours=CFG['CEMS_LOOKBACK_HRS'])
-			window	= cems_hourly.loc[
-				(cems_hourly['tstmp_utc'] >= t_start) &
-				(cems_hourly['tstmp_utc'] <= t_end)
-			].copy()
-			if window.empty:
+		for idx in sub.index:
+			t_em = df.at[idx, 't_emission']
+			if pd.isna(t_em):
 				continue
-			window['facilityId']   = tid
-			window['facilityName'] = tname
-			window['source_file']  = op['source_file']
-			results.append(window)
+			dt_ns  = np.abs(cems_t - np.datetime64(t_em, 'ns'))
+			i_best = int(dt_ns.argmin())
+			dt_hrs = float(dt_ns[i_best]) / 3.6e12	 # ns → hours
 
-	if not results:
-		print('  [CEMS] No matching windows found.')
-		return target, pd.DataFrame()
+			if dt_hrs <= tol:
+				df.at[idx, 'cems_nox_tph'] = cems_nox[i_best]
+				df.at[idx, 'cems_t_emit']  = cems.iloc[i_best]['tstmp_utc']
+				df.at[idx, 'cems_dt_hrs']  = dt_hrs
 
-	cems_long = pd.concat(results, ignore_index=True)
+		n_matched = df.loc[fac_mask, 'cems_nox_tph'].notna().sum()
+		print(f'  [CEMS] {tid} {tname}: {n_matched} / {fac_mask.sum()} rows matched')
 
-	# Per-overpass mean → for scatter-plot merge
-	cems_mean = (
-		cems_long
-		.groupby(['facilityId', 'source_file'])['noxMass_tph_metric']
-		.mean()
-		.reset_index()
-		.rename(columns={'noxMass_tph_metric': 'cems_nox_mean'})
-	)
-
-	# Facility-level stats → attach to target
-	cems_fac = (
-		cems_long
-		.groupby('facilityId')['noxMass_tph_metric']
-		.agg(cems_nox_fac_mean='mean', cems_nox_fac_std='std')
-		.reset_index()
-	)
-	target = target.merge(cems_fac, on='facilityId', how='left')
-
-	# Save
-	base_din = CT.d_noxno2 + 'd_dat/csf/' + CFG['CSF_PRCS_VER'] + '/'
-	cems_long.to_parquet(base_din + f'cems_long_{CFG["CSF_PRCS_VER"]}.parquet',
-						 engine='pyarrow', index=False)
-	cems_mean.to_parquet(base_din + f'cems_mean_{CFG["CSF_PRCS_VER"]}.parquet',
-						 engine='pyarrow', index=False)
-	print(f'  [CEMS] {len(cems_long)} sampled rows, '
-		  f'{cems_long["facilityId"].nunique()} facilities')
-	return target, cems_mean
+	return df
 
 
 # =============================================================================
 # RUN
 # =============================================================================
-if CFG['o_trop']['o_read']:
-	if CFG['o_trop']['type'] == 'csv':
-		trop_l2 = _read_gauss(sate='trop', target=target, CFG=CFG)
-	elif CFG['o_trop']['type'] == 'pq':
-		trop_l2 = pd.read_parquet(
-			f"{CT.d_noxno2}d_dat/csf/{CFG['CSF_PRCS_VER']}/"
-			f"trop_l2_{CFG['POST_PRCS_VER']}.parquet",
-			engine='pyarrow',
-		)
+if __name__ == '__main__':
 
-# Apply primary Gaussian QF gate from csf_prcs output, then user-defined cuts
-if 'QF_gauss_abs_H' in trop_l2.columns:
-	trop_l2 = trop_l2.loc[trop_l2['QF_gauss_abs_H'] == 0].reset_index(drop=True)
+	# 1. Read all CSF CSV files
+	csf = _read_csf(target=target, CFG=CFG)
 
-trop_l2 = _prcs_QF(sate='trop', data=trop_l2, QF=CFG['o_trop']['QF'])
-trop_l2 = trop_l2.loc[trop_l2['QF_abs'] == 0].reset_index(drop=True)
+	# 2. Quality filter
+	print (csf)
+	csf = _apply_qf(csf, CFG)
+	csf=	csf.loc[csf['age_hours_H']<0.2].reset_index(drop=True)
+	csf=	csf.loc[(csf['flux_nox_fit'] >= csf['flux_nox_fit'].quantile(0.00)) & (csf['flux_nox_fit'] <= csf['flux_nox_fit'].quantile(0.95))].reset_index(drop=True)
+	# 3. Match each row to its temporally corresponding CEMS record
+	csf = _match_cems(csf, target, CFG)
 
-if CFG['o_cems']['o_read']:
-	target, cems_mean = _read_cems(target=target, trop_l2=trop_l2, CFG=CFG)
+	# 4. Save merged result
+	base_dir = CT.d_noxno2 + 'd_dat/csf/' + CFG['CSF_PRCS_VER'] + '/'
+	os.makedirs(base_dir, exist_ok=True)
+	out_path = base_dir + f'post_csf_cems_{CFG["POST_PRCS_VER"]}.parquet'
+	csf.to_parquet(out_path, engine='pyarrow', index=False)
+	print(f'  [SAVE] {len(csf)} rows → {out_path}')
 
-_plot_csf_scatter(trop_l2, cems_mean, target, CFG)
+	# 5. Plot
+	dout = CT.d_noxno2 + 'd_fig/post/' + CFG['CSF_PRCS_VER'] + '/'
+	plot_no2_vs_cems(csf=csf, target=target, CFG=CFG, dout=dout)

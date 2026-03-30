@@ -577,7 +577,8 @@ def step3_no2_to_nox_flux(pss_row, suffix="_O",
 	pss_ratio  = float(pss_row.get("pss_ratio", np.nan))
 
 	if np.isnan(flux_no2) or np.isnan(pss_ratio):
-		print(f"  [step3] Cannot compute NOx flux: " f"flux_no2={flux_no2:.4f}  pss_ratio={pss_ratio:.4f}")
+		print(f"  [step3] Cannot compute NOx flux: "
+			  f"flux_no2={flux_no2:.4f}  pss_ratio={pss_ratio:.4f}")
 		return np.nan, np.nan
 
 	# Unit note: flux_no2 is in tNO2/hr (from _calc_csf).
@@ -732,16 +733,16 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS,
 	def _eval_fit_curve(k, t_ref_s=age_pss_s):
 		"""flux_nox(t) = flux_nox_PSS * exp(-k * (t - t_ref))  evaluated per row."""
 		t_s = np.abs(trop_csf_qc[age_col].values) * 3600.0
-		return pd.Series(flux_nox_PSS * np.exp(-k * (t_s - t_ref_s)),
-						 index=trop_csf_qc.index)
+		return pd.Series(flux_nox_PSS * np.exp(-k * (t_s - t_ref_s)), index=trop_csf_qc.index)
 
+	"""
 	# ------------------------------------------------------------------ #
 	# Option A: empirical exponential fit to post-PSS flux decline		  #
 	# ------------------------------------------------------------------ #
 	if option == "A":
 		pss_tid = pss_row.get("tdump_id", -1)
 		post = trop_csf_qc.loc[trop_csf_qc["tdump_id"] > pss_tid].copy()
-
+		post=	post.loc[post['age_hours_H'] < 5.].reset_index(drop=True) # vvvvv
 		if flux_col not in post.columns:
 			print("  [step4-A] No post-PSS flux data for fit.")
 			return result
@@ -752,10 +753,10 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS,
 		if len(post) < 3:
 			print(f"  [step4-A] Insufficient post-PSS points (n={len(post)}).")
 			return result
-
 		# Fit  f_rel(t_rel) = exp(-k * t_rel)  where t_rel = t - age_pss_s
 		t_rel = np.abs(post[age_col].values) * 3600.0 - age_pss_s
 		f_rel = post["flux_nox"].values / flux_nox_PSS
+		IPython.embed()
 		try:
 			popt, _ = curve_fit(lambda t, k: np.exp(-k * t), t_rel, f_rel,
 								p0=[1e-4], bounds=([0], [1e-1]), maxfev=10_000)
@@ -771,6 +772,61 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS,
 		print(f"  [step4-A] k_eff={k_eff:.2e} s-1  "
 			  f"age_PSS={age_pss_s/3600:.2f} hr  "
 			  f"flux_nox_source={flux_nox_source:.4f} tNOx/hr")
+	"""
+	# ------------------------------------------------------------------ #
+	# Option A: empirical exponential fit to full post-PSS NOx flux decay #
+	# Fits	flux_nox(t) = Q * exp(-t / lifetime)  to all QC rows at or	 #
+	# beyond the PSS point (t in hours); Q extrapolated to t=0 = source. #
+	# ------------------------------------------------------------------ #
+	def _exp_decay(t, Q, lifetime):
+		"""flux_nox(t) = Q * exp(-t / lifetime);  t [hr], Q [tNOx/hr], lifetime [hr]."""
+		return Q * np.exp(-t / lifetime)
+
+	if option == "A":
+		pss_tid = pss_row.get("tdump_id", -1)
+		fit_rows = trop_csf_qc.loc[trop_csf_qc["tdump_id"] >= pss_tid].copy()
+		fit_rows=	fit_rows.loc[fit_rows['age_hours_H']<5.0].reset_index(drop=True) # vvvvvvvv
+		if flux_col not in fit_rows.columns:
+			print("  [step4-A] No flux data for fit.")
+			return result
+
+		fit_rows["flux_nox"] = fit_rows[flux_col] * fit_rows.get("pss_ratio", 1.0)
+		fit_rows = (fit_rows.dropna(subset=[age_col,"flux_nox"]).loc[lambda d: d["flux_nox"] > 0])
+		if len(fit_rows) < 3:
+			print(f"  [step4-A] Insufficient points for fit (n={len(fit_rows)}).")
+			return result
+
+		t_hr = np.abs(fit_rows[age_col].values)			 # [hours], positive
+		f_nox = fit_rows["flux_nox"].values				  # [tNOx/hr]
+
+		try:
+			popt, _ = curve_fit( _exp_decay, t_hr, f_nox,
+				p0=[flux_nox_PSS, 2.0],
+				bounds=([0., 0.1], [flux_nox_PSS * 10, 24.]),
+				maxfev=10_000,
+			)
+			Q_fit, lifetime_hr = float(popt[0]), float(popt[1])
+		except RuntimeError:
+			print("  [step4-A] Exponential fit failed.")
+			return result
+
+		k_eff			= 1.0 / (lifetime_hr * 3600.0)	 # [s-1], consistent with Option B
+		flux_nox_source = Q_fit							  # t=0 intercept
+
+		# Per-row fitted curve over all QC rows (for plotting)
+		t_all_hr = np.abs(trop_csf_qc[age_col].values)
+		flux_nox_fit_series = pd.Series(
+			Q_fit * np.exp(-t_all_hr / lifetime_hr),
+			index=trop_csf_qc.index,
+		)
+
+		result.update({"flux_nox_source": flux_nox_source,
+					   "k_eff":			  k_eff,
+					   "flux_nox_fit":	  flux_nox_fit_series})
+		print(f"  [step4-A] Q={flux_nox_source:.4f} tNOx/hr  "
+			  f"lifetime={lifetime_hr:.2f} hr  k_eff={k_eff:.2e} s-1  "
+			  f"age_PSS={age_pss_s/3600:.2f} hr")
+
 
 	# ------------------------------------------------------------------ #
 	# Option B: analytical — k_loss from GEOS-CF [OH]					 #
@@ -842,6 +898,9 @@ def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a=
 		return trop_csf, {"status": "no_pss_point"}
 
 	# Step 3 — NO2 flux → NOx flux at PSS (scalars only)
+	t_pss=							float(trop_csf.loc[trop_csf['step2_is_pss_point']==True,'age_hours_H'])
+	l=								trop_csf['age_hours_H'] >= t_pss
+	trop_csf.loc[l,'flux_nox']=		trop_csf.loc[l,'flux_no2_H'] * trop_csf.loc[l,'pss_ratio']
 	flux_nox_PSS, pss_ratio = step3_no2_to_nox_flux(pss_row, suffix=suffix)
 	if np.isnan(flux_nox_PSS):
 		print("  [NOx workflow] Step 3 failed — aborting.")

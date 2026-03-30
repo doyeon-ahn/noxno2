@@ -10,11 +10,10 @@ from scipy.optimize import curve_fit
 import sklearn.metrics
 from shapely.geometry import Polygon
 from timezonefinder import TimezoneFinder
-import IPython
 sys.path.insert(0, os.pardir)
 import CT, FN
-from csf_plot import _plot_csf
-from csf_nox import run_nox_workflow
+from csf_plot2 import _plot_csf
+from csf_nox2 import run_nox_workflow
 
 # =============================================================================
 # CONFIG  —  all tunable parameters live here
@@ -26,9 +25,8 @@ CFG = {
 	"CSF_PRCS_VER":		CT.PRCS_VER["csf"],
 	"TARGET_INFO":		CT.df_target,
 	"SATE_INFO":		["trop", CT.DATA_VER["trop"], CT.PRCS_VER["trop"],
-						 "2023-01-01", "2024-10-31",	# date range [start, end]
-						 #"2019-01-01", "2025-12-31",	# date range [start, end]
-						 #"2022-09-26", "2022-09-27",   # date range [start, end]
+						 "2023-07-30", "2023-07-31",   # date range [start, end]
+						 #"2019-01-01", "2025-12-31",   # date range [start, end]
 						 "qf_good", "prcsd"],
 	"HYSTRAJ_RUN_VER":	CT.PRCS_VER["hystraj"],
 
@@ -37,7 +35,7 @@ CFG = {
 	# ------------------------------------------------------------------
 	"TARGET_IDS_ALL":	["6705","6076","8102","6165","6481","6002",
 						 "2103","6146","2832","2823","2167","2168"],
-	"TARGET_IDS_RUN":	['2167'], #'6165'], #"6076"],#, "2103"],			# subset to actually process
+	"TARGET_IDS_RUN":	["2103"],#, "2103"],			# subset to actually process
 
 	# ------------------------------------------------------------------
 	# Satellite pixel QA
@@ -60,7 +58,7 @@ CFG = {
 		"a1": [-50.,  50. ],				# baseline slope
 		"a2": [0.,	  1000.],				# amplitude
 		"a3": [-50., 50.],					# centre offset [km]
-		"a4": [1.,	  40.],					# FWHM [km]
+		"a4": [1.,	  40.],				   	# FWHM [km]
 	},
 
 	# ------------------------------------------------------------------
@@ -76,11 +74,6 @@ CFG = {
 		"a4sigpct_max":		50.,			# width uncertainty [%]
 		"nobs_min":			5,				# minimum pixel count
 	},
-
-	# ------------------------------------------------------------------
-	# Plume trajectory optimization using a3
-	# ------------------------------------------------------------------
-	'TDOPT': {'on':		False},
 
 	# ------------------------------------------------------------------
 	# NOx workflow	(csf_nox.run_nox_workflow)
@@ -100,7 +93,7 @@ CFG = {
 	"FLUX_UNIT":		"[tNO2/hr]",
 	"o_calc_nox":		False,			  # legacy NOx lifetime fit
 	"o_plot":			True,			  # produce PNG plots
-	"o_plot_every":		1,			  # plot every N overpasses
+	"o_plot_every":		100,			  # plot every N overpasses
 	"o_plot_wddiff":	False,			  # overlay wind-direction comparison
 	"snapshot":			True,			  # save code snapshot on completion
 
@@ -244,7 +237,8 @@ def _read_cems_nox(tid, tname, time_utc):
 		print(f"  [CEMS] No data in {t_start} – {t_end} for {tid}")
 		return pd.DataFrame()
 	cems["noxMass"] = pd.to_numeric(cems["noxMass"], errors="coerce")
-	hourly = (cems.groupby("tstmp_utc", as_index=False)["noxMass"].sum().rename(columns={"noxMass": "noxMass_tph"}))
+	hourly = (cems.groupby("tstmp_utc", as_index=False)["noxMass"]
+				  .sum().rename(columns={"noxMass": "noxMass_tph"}))
 	hourly["noxMass_tph_metric"] = hourly["noxMass_tph"] * 0.000453592	 # lbs/hr → t/hr
 	return hourly
 
@@ -486,11 +480,9 @@ def _csf_prcs(CFG, target):
 	  2c. Tag trajectory with backward UTC times
 	  2d. Sample pixels along HYSPLIT trajectory
 	  2e. First-pass Gaussian CSF  (_H suffix) + QF
-		___ 2f - 2h are optional ___
 	  2f. Build optimised trajectory from a3 peak locations
 	  2g. Re-sample on optimised trajectory
 	  2h. Optimised Gaussian CSF  (_O suffix) + QF
-		____________________________
 	  2i. Merge, save CSV, run NOx workflow
 	  2j. CEMS lookup
 	  2k. Plot
@@ -533,24 +525,21 @@ def _csf_prcs(CFG, target):
 			trop_csf   = trop_csf.add_suffix("_H").rename(columns={"tdump_id_H": "tdump_id"})
 			trop_csf   = _calc_qf_gauss(trop_csf, suffix="_H")
 
-			if CFG['TDOPT']['on'] == True:
-				# 2f. Build optimised trajectory
-				true_tdump = _build_true_tdump(
-					trop_csf.rename(columns=lambda c: c.replace("_H", "")), tdump)
+			# 2f. Build optimised trajectory
+			true_tdump = _build_true_tdump(
+				trop_csf.rename(columns=lambda c: c.replace("_H", "")), tdump)
 
-				# 2g-h. Optimised CSF (_O) + quality flag
-				trop_true_sampled = pd.DataFrame()
-				if len(true_tdump) >= 2:
-					trop_true_sampled = _sample_soundings_along_traj("trop", trop, true_tdump)
-					if len(trop_true_sampled) > 0:
-						constraint_true = _define_gaussian_constraints("trop", trop_true_sampled)
-						csf_true		= _calc_csf("trop", target.loc[it], trop_true_sampled,
-													constraint_true, true_tdump)
-						csf_true  = csf_true.add_suffix("_O").rename(columns={"tdump_id_O": "tdump_id"})
-						csf_true  = _calc_qf_gauss(csf_true, suffix="_O")
-						trop_csf  = trop_csf.merge(csf_true, on="tdump_id", how="left")
-			if CFG['TDOPT']['on'] == False:
-				true_tdump = tdump.copy()
+			# 2g-h. Optimised CSF (_O) + quality flag
+			trop_true_sampled = pd.DataFrame()
+			if len(true_tdump) >= 2:
+				trop_true_sampled = _sample_soundings_along_traj("trop", trop, true_tdump)
+				if len(trop_true_sampled) > 0:
+					constraint_true = _define_gaussian_constraints("trop", trop_true_sampled)
+					csf_true		= _calc_csf("trop", target.loc[it], trop_true_sampled,
+												constraint_true, true_tdump)
+					csf_true  = csf_true.add_suffix("_O").rename(columns={"tdump_id_O": "tdump_id"})
+					csf_true  = _calc_qf_gauss(csf_true, suffix="_O")
+					trop_csf  = trop_csf.merge(csf_true, on="tdump_id", how="left")
 
 			# 2i. Run NOx workflow, save to csv
 			trop_csf, nox_result = run_nox_workflow(
@@ -563,42 +552,38 @@ def _csf_prcs(CFG, target):
 			)
 			trop_csf.to_csv(dout_csv + fout + ".csv", index=False)
 
-			# 2j-k. Read CEMS + plot
-			if (CFG["o_plot"] and i_sate % CFG["o_plot_every"] == 0 and len(trop_csf) > 1):
+			# 2j-k. CEMS + plot
+			do_plot = (CFG["o_plot"] and i_sate % CFG["o_plot_every"] == 0
+					   and len(trop_csf) > 1 and len(trop_true_sampled) > 1)
+			if do_plot:
 				cems_nox = _read_cems_nox(tid, tname, sate_row["time_utc"])
 				if not cems_nox.empty:
-					print(f"  [CEMS] {len(cems_nox)} records, " f"mean = {cems_nox['noxMass_tph_metric'].mean():.2f} {CFG['FLUX_UNIT']}")
-
-				plot_kwargs = dict(
-					CFG				 = CFG,
-					target			 = target.loc[it],
-					data			 = trop,
-					data_sampled	 = trop_sampled,
-					data_csf		 = trop_csf,
-					tdump			 = tdump,
-					sate			 = sate_row,
-					flux_unit		 = CFG["FLUX_UNIT"],
-					o_plot_wddiff	 = CFG["o_plot_wddiff"],
-					dfout			 = dout_png + fout,
-					cems_nox		 = cems_nox,
-					true_tdump		 = true_tdump,
-					trop_csf		 = trop_csf,
-					nox_result		 = nox_result,
+					print(f"  [CEMS] {len(cems_nox)} records, "
+						  f"mean = {cems_nox['noxMass_tph_metric'].mean():.2f} {CFG['FLUX_UNIT']}")
+				_plot_csf(
+					CFG,
+					target			  = target.loc[it],
+					data			  = trop,
+					data_sampled	  = trop_sampled,
+					data_true_sampled = trop_true_sampled,
+					data_csf		  = trop_csf,
+					tdump			  = tdump,
+					sate			  = sate_row,
+					flux_unit		  = CFG["FLUX_UNIT"],
+					o_plot_wddiff	  = CFG["o_plot_wddiff"],
+					dfout			  = dout_png + fout,
+					cems_nox		  = cems_nox,
+					true_tdump		  = true_tdump,
+					trop_csf		  = trop_csf,
+					nox_result		  = nox_result,
 				)
-
-				if CFG['TDOPT']['on']:
-					plot_kwargs['data_true_sampled'] = trop_true_sampled
-
-				_plot_csf(**plot_kwargs)
-
-	#return trop_csf
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
-	_ = _csf_prcs(CFG, target)
+	_csf_prcs(CFG, target)
 	if CFG["snapshot"]:
 		FN._SNAPSHOT(name="csf_prcs", tag=CFG["CSF_PRCS_VER"],
 					 scripts=["csf_prcs.py"], cfg=CFG,
