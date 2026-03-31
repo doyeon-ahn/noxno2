@@ -26,9 +26,9 @@ CFG = {
 	"CSF_PRCS_VER":		CT.PRCS_VER["csf"],
 	"TARGET_INFO":		CT.df_target,
 	"SATE_INFO":		["trop", CT.DATA_VER["trop"], CT.PRCS_VER["trop"],
-						 "2023-01-01", "2024-10-31",	# date range [start, end]
+						 #"2023-01-01", "2024-10-31",	# date range [start, end]
 						 #"2019-01-01", "2025-12-31",	# date range [start, end]
-						 #"2022-09-26", "2022-09-27",   # date range [start, end]
+						 "2023-01-30", "2023-01-31",   # date range [start, end]
 						 "qf_good", "prcsd"],
 	"HYSTRAJ_RUN_VER":	CT.PRCS_VER["hystraj"],
 
@@ -80,7 +80,13 @@ CFG = {
 	# ------------------------------------------------------------------
 	# Plume trajectory optimization using a3
 	# ------------------------------------------------------------------
-	'TDOPT': {'on':		False},
+	'TDOPT': {'method':		'moore',
+				# High-NO2 pixel-chain trajectory  (tdump_highNO2)
+				"search_radius_deg": 0.15,	 # neighbour search radius [deg] (~2–3 TROPOMI pixels)
+				"bg_snr_thresh":	 1.0,	 # stop threshold: zbg + thresh * zbg_sig
+				"max_steps":		 60,	 # hard ceiling on chain length
+				"smooth_poly_deg":	2,
+			},
 
 	# ------------------------------------------------------------------
 	# NOx workflow	(csf_nox.run_nox_workflow)
@@ -192,6 +198,8 @@ def _read_trop(dfin, tname_long, sate_row):
 		var_list += ["longitude_bounds", "latitude_bounds"]
 	with xr.open_dataset(dfin, engine="netcdf4", mask_and_scale=False) as ds:
 		data = ds[var_list].load()
+		scanline_idx	= data["scanline"].values		# shape (scanline,)
+		groundpx_idx	= data["ground_pixel"].values	# shape (ground_pixel,)
 	no2		 = data["nitrogendioxide_tropospheric_column"].values
 	no2_prec = data["nitrogendioxide_tropospheric_column_precision"].values
 	qa		 = data["qa_value"].values
@@ -199,6 +207,13 @@ def _read_trop(dfin, tname_long, sate_row):
 	lat		 = data["latitude"].values
 	lon		 = data["longitude"].values
 	time_utc = np.repeat(time_utc[:, :, np.newaxis], no2.shape[2], axis=2)
+
+	# build full 2-D index arrays matching (time, scanline, ground_pixel)
+	# scanline varies along axis-1, ground_pixel along axis-2
+	sl_2d, gp_2d = np.meshgrid(scanline_idx, groundpx_idx, indexing="ij")  # (scanline, ground_pixel)
+	sl_3d = sl_2d[np.newaxis, :, :]   # broadcast over time dim
+	gp_3d = gp_2d[np.newaxis, :, :]
+
 	mask = (no2.ravel() >= 0.0) & (qa.ravel() >= CFG["QA_MIN"])
 	trop = pd.DataFrame({
 		"no2":			 no2.ravel()[mask] * 1e6,	# mol m-2 → µmol m-2
@@ -207,6 +222,8 @@ def _read_trop(dfin, tname_long, sate_row):
 		"time_utc":		 time_utc.ravel()[mask],
 		"latitude":		 lat.ravel()[mask],
 		"longitude":	 lon.ravel()[mask],
+		"scanline":		 sl_3d.ravel()[mask],
+		"ground_pixel":  gp_3d.ravel()[mask],
 	})
 	if CFG["o_plot"]:
 		lonb  = data["longitude_bounds"].values.reshape(-1, 4)[mask]
@@ -320,8 +337,7 @@ def _define_gaussian_constraints(satellite, data_sampled):
 # =============================================================================
 def _calc_csf(satellite, target, data, constraint, tdump):
 	"""Fit Gaussian to each transect; return per-transect CSF metrics."""
-	merge_cols = ["tdump_id","longitude","latitude","age_hours",
-				  "month","hour","temp","pres","u","v","wso","wd","time_tag"]
+	merge_cols = ["tdump_id","longitude","latitude","age_hours", "month","hour","temp","pres","wso","wd","time_tag"]
 	out = (pd.DataFrame({"tdump_id": data["tdump_id"].unique()})
 			 .merge(tdump[merge_cols], on="tdump_id", how="left")
 			 .rename(columns={"longitude": "lon_tdump", "latitude": "lat_tdump"}))
@@ -374,8 +390,10 @@ def _calc_csf(satellite, target, data, constraint, tdump):
 				* (a4 * 1e3)					  # km → m
 				* out.loc[i, "wso"] * 3600.)	  # m s-1 → m hr-1
 	if "flux_no2" in out.columns or "flux_co2" in out.columns:
-		out["u_std"]   = out["u"].std()
-		out["v_std"]   = out["v"].std()
+		wd_rad	 = np.radians(out["wd"].values)
+		wd_R	 = np.sqrt(np.nanmean(np.sin(wd_rad))**2 + np.nanmean(np.cos(wd_rad))**2)  # mean resultant length
+		out["wd_std"] = np.degrees(np.sqrt(-2. * np.log(wd_R)))   						   # circular std of wd [deg]
+
 		out["wd_diff"] = None
 		if "lat_a3" in out.columns and len(out) > 1:
 			wd_a3  = _calculate_bearing(out["lat_a3"].iloc[0],	  out["lon_a3"].iloc[0],
@@ -419,7 +437,7 @@ def _calc_qf_gauss(csf, suffix=""):
 # =============================================================================
 # TRAJECTORY HELPERS
 # =============================================================================
-def _build_true_tdump(data_csf, tdump):
+def _TDOPT_a3(data_csf, tdump):
 	"""Build optimised trajectory from Gaussian peak locations (a3 lat/lon)."""
 	valid = data_csf.dropna(subset=["lon_a3","lat_a3"]).reset_index(drop=True)
 	if len(valid) < 2:
@@ -449,6 +467,195 @@ def _build_true_tdump(data_csf, tdump):
 	bearings[0] = bearings[1]
 	true["wd"]	= bearings
 	return true
+
+
+# =============================================================================
+# HIGH-NO2 PIXEL-CHAIN TRAJECTORY
+# =============================================================================
+# Add to CFG["HIGHNO2"] block:
+#	"search_radius_deg": 0.15,	 # neighbor search radius [deg] — ~2–3 TROPOMI pixels
+#	"bg_snr_thresh":	 1.0,	 # stop when local max < zbg + thresh * zbg_sig
+#	"max_steps":		 60,	 # hard ceiling on walk length
+# CFG addition:
+# "HIGHNO2": {
+#	  "bg_snr_thresh": 1.0,   # stop when cell no2 < zbg + thresh * zbg_sig
+#	  "max_steps":	   60,	  # hard ceiling on chain length
+# },
+
+def _TDOPT_moore(trop, target_row, tdump):
+	"""
+	Build a plume-following trajectory by chaining peak-NO2 TROPOMI pixels
+	downwind from the source, using a Moore (3x3) neighbourhood walk on
+	the native scanline × ground_pixel raster.
+
+	Steps
+	-----
+	1. Build a lookup dict (scanline, ground_pixel) -> no2 from trop.
+	2. Compute scene background zbg (median) and zbg_sig (IQR).
+	3. Seed at the pixel nearest the facility (lon/lat distance).
+	4. Walk: at each step move to the unvisited 3x3 Moore neighbour
+	   with the highest NO2 still above (zbg + bg_snr_thresh * zbg_sig).
+	5. Map each waypoint to the nearest tdump row to inherit meteorology.
+
+	Returns
+	-------
+	DataFrame with same schema as _build_true_tdump output,
+	or empty DataFrame if fewer than 2 waypoints were found.
+	"""
+	cfg_h  = CFG['TDOPT']
+	thresh = cfg_h["bg_snr_thresh"]
+	maxstp = cfg_h["max_steps"]
+
+	sls  = trop["scanline"].values
+	gps  = trop["ground_pixel"].values
+	lons = trop["longitude"].values
+	lats = trop["latitude"].values
+	no2  = trop["no2"].values
+
+	# ------------------------------------------------------------------ #
+	# 1. Build raster lookup on native TROPOMI grid indices				  #
+	# ------------------------------------------------------------------ #
+	grid	 = {}	# (sl, gp) -> no2
+	cell_lon = {}	# (sl, gp) -> longitude
+	cell_lat = {}	# (sl, gp) -> latitude
+	for k in range(len(no2)):
+		key = (int(sls[k]), int(gps[k]))
+		grid[key]	  = no2[k]
+		cell_lon[key] = lons[k]
+		cell_lat[key] = lats[k]
+
+	# ------------------------------------------------------------------ #
+	# 2. Background stats (scene-wide)									  #
+	# ------------------------------------------------------------------ #
+	no2_vals	= np.array(list(grid.values()))
+	zbg			= np.nanmedian(no2_vals)
+	zbg_sig		= np.nanquantile(no2_vals, 0.75) - np.nanquantile(no2_vals, 0.25)
+	plume_floor = zbg + thresh * zbg_sig
+
+	# ------------------------------------------------------------------ #
+	# 3. Seed: pixel with minimum lon/lat distance to facility			  #
+	# ------------------------------------------------------------------ #
+	dist2 = (lons - target_row["lon"])**2 + (lats - target_row["lat"])**2
+	k0	  = int(np.argmin(dist2))
+	seed  = (int(sls[k0]), int(gps[k0]))
+
+	# ------------------------------------------------------------------ #
+	# 4. Moore-neighbourhood walk on (scanline, ground_pixel) grid		  #
+	# ------------------------------------------------------------------ #
+	visited   = set()
+	waypoints = []		# list of (sl, gp) keys
+
+	cur = seed
+	for _ in range(maxstp):
+		visited.add(cur)
+		waypoints.append(cur)
+
+		best_key = None
+		best_no2 = -np.inf
+		for dsl in range(-1, 2):
+			for dgp in range(-1, 2):
+				if dsl == 0 and dgp == 0:
+					continue
+				nb = (cur[0] + dsl, cur[1] + dgp)
+				if nb in visited or nb not in grid:
+					continue
+				if grid[nb] >= plume_floor and grid[nb] > best_no2:
+					best_no2 = grid[nb]
+					best_key = nb
+
+		if best_key is None:
+			break
+
+		cur = best_key
+
+	if len(waypoints) < 2:
+		return pd.DataFrame()
+
+	# ------------------------------------------------------------------ #
+	# 5. Match waypoints to nearest tdump row; assemble output			  #
+	# ------------------------------------------------------------------ #
+	tdump_lats = tdump["latitude"].values
+	tdump_lons = tdump["longitude"].values
+
+	rows = []
+	for key in waypoints:
+		wp_lon = cell_lon[key]
+		wp_lat = cell_lat[key]
+		d_m    = _haversine_m(wp_lat, wp_lon, tdump_lats, tdump_lons)
+		j	   = int(np.argmin(d_m))
+		td	   = tdump.iloc[j]
+		rows.append({
+			"tdump_id":  int(td["tdump_id"]),
+			"longitude": wp_lon,
+			"latitude":  wp_lat,
+			"no2":		 grid[key],
+			"age_hours": td["age_hours"],
+			"age_km":	 td["age_km"],
+			"month":	 int(td["month"]),
+			"hour":		 int(td["hour"]),
+			"temp":		 td["temp"],
+			"pres":		 td["pres"],
+			"tstmp":	 td["tstmp"],
+			"time_tag":  td["time_tag"],
+			"wso":		 td["wso"],
+		})
+
+	chain = pd.DataFrame(rows).reset_index(drop=True)
+
+	# recompute wind direction from chained geometry
+	clats = chain["latitude"].values
+	clons = chain["longitude"].values
+	dt	  = (tdump.loc[1, "tstmp"] - tdump.loc[0, "tstmp"]).seconds
+	bearings	 = _calculate_bearing(clats[0], clons[0], clats, clons)
+	bearings[0]  = bearings[1]
+	chain["wd"]  = bearings
+
+	# wind speed summary: mean ± std across HYSPLIT-matched rows
+	# stored as scalars broadcast to all rows — consistent with how
+	# _calc_csf consumes wso (per-row, but nearly constant along a short plume)
+	chain["wso__std"] = chain['wso'].std()
+	chain["wso"] = chain['wso'].mean()
+
+	chain = chain.sort_values(['age_km']).reset_index(drop=True)
+	chain['tdump_id']= chain.index
+
+	return chain
+
+def _smooth_chain_trajectory(chain, tdump, poly_deg=2):
+	"""
+	Fit a polynomial lon(age_km), lat(age_km) through the raw
+	tdump_highNO2 chain to remove zigzag noise.
+	Returns a tdump-shaped DataFrame resampled at original chain spacing.
+	"""
+	chain= 	chain.drop_duplicates("age_km").reset_index(drop=True)
+
+	if len(chain) < poly_deg + 1:
+		return chain
+
+	t	= np.unique(chain["age_km"].values)
+	t_n = (t - t[0]) / (t[-1] - t[0] + 1e-9) # normalize t to [0,1] for numerical stability
+
+	plon = np.polyfit(t_n, chain["longitude"].values, poly_deg)
+	plat = np.polyfit(t_n, chain["latitude"].values,  poly_deg)
+
+	smoothed = chain.copy()
+	smoothed["longitude"] = np.polyval(plon, t_n)
+	smoothed["latitude"]  = np.polyval(plat, t_n)
+
+	# recompute wind fields on smoothed geometry
+	clats = smoothed["latitude"].values
+	clons = smoothed["longitude"].values
+	dt	  = (tdump.loc[1, "tstmp"] - tdump.loc[0, "tstmp"]).seconds
+	wso   = _haversine_m(clats[:-1], clons[:-1], clats[1:],  clons[1:])  / dt
+	u	  = _haversine_m(clats[:-1], clons[:-1], clats[:-1], clons[1:])  / dt
+	v	  = _haversine_m(clats[:-1], clons[1:],  clats[1:],  clons[1:])  / dt
+	bearings		= _calculate_bearing(clats[0], clons[0], clats, clons)
+	bearings[0]		= bearings[1]
+	smoothed["wd"]	= bearings
+
+	return smoothed
+
+
 
 
 # =============================================================================
@@ -533,11 +740,17 @@ def _csf_prcs(CFG, target):
 			trop_csf   = trop_csf.add_suffix("_H").rename(columns={"tdump_id_H": "tdump_id"})
 			trop_csf   = _calc_qf_gauss(trop_csf, suffix="_H")
 
-			if CFG['TDOPT']['on'] == True:
+			if CFG['TDOPT']['method'] == None:
+				true_tdump = tdump.copy()
+			else:
 				# 2f. Build optimised trajectory
-				true_tdump = _build_true_tdump(
-					trop_csf.rename(columns=lambda c: c.replace("_H", "")), tdump)
+				if CFG['TDOPT']['method'] == 'a3':
+					true_tdump = _TDOPT_a3(trop_csf.rename(columns=lambda c: c.replace("_H", "")), tdump)
 
+				# 2f. Build optimised trajectory
+				if CFG['TDOPT']['method'] == 'moore':
+					true_tdump = _TDOPT_moore(trop, target.loc[it], tdump)
+					true_tdump = _smooth_chain_trajectory(true_tdump, tdump, poly_deg=CFG["TDOPT"]["smooth_poly_deg"])
 				# 2g-h. Optimised CSF (_O) + quality flag
 				trop_true_sampled = pd.DataFrame()
 				if len(true_tdump) >= 2:
@@ -549,9 +762,7 @@ def _csf_prcs(CFG, target):
 						csf_true  = csf_true.add_suffix("_O").rename(columns={"tdump_id_O": "tdump_id"})
 						csf_true  = _calc_qf_gauss(csf_true, suffix="_O")
 						trop_csf  = trop_csf.merge(csf_true, on="tdump_id", how="left")
-			if CFG['TDOPT']['on'] == False:
-				true_tdump = tdump.copy()
-
+			#IPython.embed()
 			# 2i. Run NOx workflow, save to csv
 			trop_csf, nox_result = run_nox_workflow(
 				trop_csf	  = trop_csf,
@@ -563,6 +774,7 @@ def _csf_prcs(CFG, target):
 			)
 			trop_csf.to_csv(dout_csv + fout + ".csv", index=False)
 
+			#IPython.embed()
 			# 2j-k. Read CEMS + plot
 			if (CFG["o_plot"] and i_sate % CFG["o_plot_every"] == 0 and len(trop_csf) > 1):
 				cems_nox = _read_cems_nox(tid, tname, sate_row["time_utc"])
@@ -586,7 +798,7 @@ def _csf_prcs(CFG, target):
 					nox_result		 = nox_result,
 				)
 
-				if CFG['TDOPT']['on']:
+				if CFG['TDOPT']['method'] != None:
 					plot_kwargs['data_true_sampled'] = trop_true_sampled
 
 				_plot_csf(**plot_kwargs)
