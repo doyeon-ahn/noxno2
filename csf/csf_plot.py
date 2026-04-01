@@ -8,15 +8,18 @@ import numpy as np
 import pandas as pd
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import sys
-sys.path.insert(0, "..")
+sys.path.insert(0, os.pardir)
 import CT, FN
+# vvv: removed unused IPython import
 
 # =============================================================================
 # csf_plot.py  v20260324
 # Compatible with csf_nox.py run_nox_workflow output:
-#	trop_csf  — per-row columns: pss_ratio, step2_qc_pass, step2_is_pss_point
-#	nox_result — scalars: pss_tdump_id, pss_ratio, flux_nox_PSS,
-#				 flux_nox_source, k_loss, k_eff, age_at_PSS_s, oh_nd, option
+#   data_csf   — per-row columns suffixed _H / _O:
+#                pss_ratio{s}, step2_qc_pass{s}, step2_is_pss_point{s}, flux_nox_fit{s}
+#   nox_result — scalar dict (keys are NOT suffixed per S3):
+#                status, pss_tdump_id, pss_ratio, flux_nox_PSS,
+#                flux_nox_source, k_loss, k_eff, age_at_PSS_s, oh_nd, option
 # =============================================================================
 
 # =============================================================================
@@ -42,16 +45,17 @@ def _fmt_sigpct(val):
 	return "> 100" if val > 100. else str(val)
 
 
-def _scatter_qf(ax, data_csf, age_col, val_col, color, marker="o", label=None):
-	"""Scatter plot split by QF_gauss_abs_H: good=marker, bad='x'."""
-	qf = "QF_gauss_abs_H"
+# vvv: _scatter_qf now accepts suffix parameter instead of hardcoding "QF_gauss_abs_H"
+def _scatter_qf(ax, data_csf, age_col, val_col, color, suffix="_H", marker="o", label=None):
+	"""Scatter plot split by QF_gauss_abs{suffix}: filled=good, 'x'=bad."""
+	qf = "QF_gauss_abs" + suffix
 	if qf in data_csf.columns:
 		good = data_csf[data_csf[qf] == 0]
 		bad  = data_csf[data_csf[qf] == 1]
 		ax.scatter(good[age_col], good[val_col], marker=marker, color=color, label=label, zorder=5)
-		ax.scatter(bad[age_col],  bad[val_col],  marker="x",	color=color, zorder=5)
+		ax.scatter(bad[age_col],  bad[val_col],  marker="x",    color=color, zorder=5)
 	else:
-		ax.scatter(data_csf[age_col], data_csf[val_col], marker=marker, edgecolor=color, facecolor=none, label=label, zorder=5)
+		ax.scatter(data_csf[age_col], data_csf[val_col], marker=marker, edgecolor=color, facecolor="none", label=label, zorder=5)
 
 
 # =============================================================================
@@ -59,8 +63,8 @@ def _scatter_qf(ax, data_csf, age_col, val_col, color, marker="o", label=None):
 # =============================================================================
 
 def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=0.):
-	ax.set_xlim([target["lon"] - 0.82, target["lon"] + 0.82])
-	ax.set_ylim([target["lat"] - 0.88, target["lat"] + 0.88])
+	ax.set_xlim([target["lon"] - 1.00, target["lon"] + 1.00])
+	ax.set_ylim([target["lat"] - 1.05, target["lat"] + 1.05])
 	for axis in ["x", "y"]:
 		ax.tick_params(axis=axis, which="both", left=False, right=False, bottom=False, top=False, labelleft=False, labelbottom=False)
 
@@ -83,42 +87,40 @@ def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H
 	cb.ax.tick_params(labelsize=6)
 	cb.ax.text(0.5, 1.05, style["label"], transform=cb.ax.transAxes, va="bottom", ha="left")
 
-
 	# Optional wind-direction comparison overlay
+	# data_csf_H has _H suffix stripped (see _plot_csf), so columns are bare here
 	if o_plot_wddiff:
 		ax.plot(data_csf_H.iloc[:-1]["lon_a3"], data_csf_H.iloc[:-1]["lat_a3"], color="white", lw=0.7)
 		ax.scatter(data_csf_H.iloc[:-1]["lon_a3"], data_csf_H.iloc[:-1]["lat_a3"], edgecolor="white", marker="o", s=3.0, lw=0.7, facecolor="none")
 		for i in range(len(data_csf_H)):
 			ax.plot(data_csf_H.loc[i, ["lon_a3_i", "lon_a3_f"]].values, data_csf_H.loc[i, ["lat_a3_i", "lat_a3_f"]].values, color="black", lw=0.5)
 			if i % 2 == 0:
-				ax.text(data_csf_H.loc[i, "lon_a3"], data_csf_H.loc[i, "lat_a3"],
-						str(data_csf_H.loc[i, "tdump_id"]), fontsize=4)
-				ax.text(data_csf_H.loc[i, "lon_a3"], data_csf_H.loc[i, "lat_a3"],
-						str(int(data_csf_H.loc[i, "wd_diff_avg"])), fontsize=4)
+				ax.text(data_csf_H.loc[i, "lon_a3"], data_csf_H.loc[i, "lat_a3"], str(data_csf_H.loc[i, "tdump_id"]), fontsize=4)
+				ax.text(data_csf_H.loc[i, "lon_a3"], data_csf_H.loc[i, "lat_a3"], str(int(data_csf_H.loc[i, "wd_diff_avg"])), fontsize=4)
 
 	# Trajectory
 	ax.plot(tdump["longitude"].values, tdump["latitude"].values, color="white", lw=0.8, linestyle="solid", marker="o", markersize=0.1)
 	if len(true_tdump) > 1:
-		#ax.plot(true_tdump["longitude"].values, true_tdump["latitude"].values, color="magenta", lw=0.7, linestyle="solid", marker="o", markersize=3.0)
 		ax.plot(true_tdump["longitude"].values, true_tdump["latitude"].values, color="magenta", lw=0.7, linestyle="solid", marker="o", markersize=3.0)
 
-
 	# Transect segments
+	# data_csf_H has _H stripped so column names here are bare (a3, a4, lon_a3, etc.)
+	# _O columns retain their suffix (a3_O, a4_O) since only _H was stripped
 	for tid in data_sampled["tdump_id"].unique():
 		row		 = data_csf_H.loc[data_csf_H["tdump_id"] == tid].iloc[0]
 		seg		 = data_sampled.loc[data_sampled["tdump_id"] == tid]
 		fwhm	 = seg.loc[(seg["dist_ortho"] >= row["a3"] - row["a4"]/2) &
 						   (seg["dist_ortho"] <= row["a3"] + row["a4"]/2)]
 		ax.scatter(row["lon_a3"], row["lat_a3"], edgecolor="white", marker="o", s=3.0, lw=0.7, facecolor="none")
-		ax.plot(seg["lon_ortho"],	 seg["lat_ortho"],	  linestyle="dashed", color=style["clr_ortho"], lw=0.40)
-		ax.plot(fwhm["lon_ortho"],	 fwhm["lat_ortho"],   linestyle="solid",  color="black",		  lw=0.40)
+		ax.plot(seg["lon_ortho"],  seg["lat_ortho"],  linestyle="dashed", color=style["clr_ortho"], lw=0.40)
+		ax.plot(fwhm["lon_ortho"], fwhm["lat_ortho"], linestyle="solid",  color="black",            lw=0.40)
 
 		if len(data_true_sampled) > 1:
 			seg_true = data_true_sampled.loc[data_true_sampled["tdump_id"] == tid]
 			fwhm_t	 = seg_true.loc[(seg_true["dist_ortho"] >= row["a3_O"] - row["a4_O"]/2) &
 									(seg_true["dist_ortho"] <= row["a3_O"] + row["a4_O"]/2)]
-			ax.plot(seg_true["lon_ortho"],	 seg_true["lat_ortho"],	  linestyle="dashed", color='magenta', lw=0.40)
-			ax.plot(fwhm_t["lon_ortho"], fwhm_t["lat_ortho"], linestyle="solid",  color="red", lw=0.4, zorder=10)
+			ax.plot(seg_true["lon_ortho"], seg_true["lat_ortho"], linestyle="dashed", color='magenta', lw=0.40)
+			ax.plot(fwhm_t["lon_ortho"],   fwhm_t["lat_ortho"],  linestyle="solid",  color="red",     lw=0.4, zorder=10)
 
 	sat_label = "TROPOMI" if CFG["SATE_INFO"][0] == "trop" else "OCO-3"
 	ax.text(0.04, 0.96, f"{pd.to_datetime(sate['time_utc']).strftime('%Y-%m-%d %H:%M')} (UTC)", va="center", transform=ax.transAxes, color=style["clr_text"], fontsize=6)
@@ -151,32 +153,25 @@ def _plot_gaussian(ax, pp_list, CFG, data_csf, data_sampled, data_true_sampled, 
 
 		## sampled from HYSPLIT: data_sampled (_H)
 		if len(data_sampled) > 1:
-			sfx=	'_H'
+			sfx = '_H'
 			tmp = data_sampled.loc[data_sampled["tdump_id"] == row["tdump_id"]].reset_index(drop=True)
-			ax[pp].scatter(tmp["dist_ortho"], tmp[voi], marker="o", edgecolor="grey", facecolor="none", s=2., lw=0.4, alpha=0.5)
 			qf_pass = "QF_gauss_abs"+sfx in data_csf.columns and row["QF_gauss_abs"+sfx] == 0
 			ls		= "solid" if qf_pass else "dotted"
 			params = row[["a0"+sfx, "a1"+sfx, "a2"+sfx, "a3"+sfx, "a4"+sfx]].values
 			x_fit  = np.arange(xlim[0], xlim[1])
-			ax[pp].plot(x_fit, FN._gaussian(x_fit, *params), color='darkgrey', lw=1.0, ls=ls)
+			#ax[pp].plot(x_fit, FN._gaussian(x_fit, *params), color='darkgrey', lw=1.0, ls=ls, zorder=1)
 
-		## sampled using optimization algorihtm (moore or a3): data_true_sampled
+		## sampled using optimisation algorithm (moore or a3): data_true_sampled (_O)
 		if len(data_true_sampled) > 1:
-			sfx=	'_O'
+			sfx = '_O'
 			tmp = data_true_sampled.loc[data_true_sampled["tdump_id"] == row["tdump_id"]].reset_index(drop=True)
-			ax[pp].scatter(tmp["dist_ortho"], tmp[voi], marker="o", edgecolor="black", facecolor="none", s=2., lw=0.4, alpha=0.6)
+			ax[pp].scatter(tmp["dist_ortho"], tmp[voi], marker="o", edgecolor="black", facecolor="none", s=2., lw=0.4, alpha=0.6, zorder=2)
 
 			qf_pass = "QF_gauss_abs"+sfx in data_csf.columns and row["QF_gauss_abs"+sfx] == 0
 			ls		= "solid" if qf_pass else "dotted"
 			params = row[["a0"+sfx, "a1"+sfx, "a2"+sfx, "a3"+sfx, "a4"+sfx]].values
 			x_fit  = np.arange(xlim[0], xlim[1])
-			ax[pp].plot(x_fit, FN._gaussian(x_fit, *params), color='red', lw=1.0, ls=ls)
-
-			#x1, x2 = row["a3"] - row["a4"]/2, row["a3"] + row["a4"]/2
-			#y1, y2 = FN._gaussian(x1, *params), FN._gaussian(x2, *params)
-			#ax[pp].scatter(row["a3"], (y1 + y2) / 2, marker="o", color="red", s=5.)
-			#ax[pp].plot([x1, x2], [y1, y2], color="red", lw=0.70)
-
+			ax[pp].plot(x_fit, FN._gaussian(x_fit, *params), color='red', lw=1.0, ls=ls, zorder=3)
 
 			if not np.isnan(row[flux_var+sfx]):
 				for k, (xpos, txt) in enumerate([
@@ -197,28 +192,32 @@ def _plot_gaussian(ax, pp_list, CFG, data_csf, data_sampled, data_true_sampled, 
 # =============================================================================
 # PANEL 3 — flux vs. transport time with NOx workflow results overlay
 # =============================================================================
-def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_unit, style, var_to_plot):
+def _plot_flux_vs_time(ax, CFG, data_csf, nox_result, cems_nox, flux_unit, style, var_to_plot, nox_suffix="_O"):
+	# vvv: nox_suffix parameter added so this function knows which suffix was used
+	#      for per-row NOx columns (pss_ratio, flux_nox_fit) written by run_nox_workflow
 	"""
 	Bottom panel: cross-sectional flux vs. transport time.
 
-	data_csf   — suffixed DataFrame (_H / _O columns)
-	trop_csf   — per-row NOx workflow output (pss_ratio, step2_qc_pass,
-				 step2_is_pss_point added by run_nox_workflow)
-	nox_result — scalar dict from run_nox_workflow (may be None)
+	data_csf   — suffixed DataFrame (_H / _O columns).
+	nox_result — scalar dict from run_nox_workflow (keys are NOT suffixed per S3).
+	nox_suffix — suffix used in run_nox_workflow call ("_H" or "_O"); determines
+	             which per-row NOx columns to read from data_csf.
 	"""
 	if var_to_plot == 'nox':
 
 		flux_var = style["flux_var"]
+		age_H    = "age_hours_H"
+		age_O    = "age_hours_O"
 
-		#ax.set_xlabel("Transport time [hours]")
 		ax.set_ylabel(f"Cross-sectional flux {flux_unit}")
 
 		# --- CSF fluxes (HYSPLIT + Optimized) ---
-		_scatter_qf(ax, data_csf, "age_hours_H", flux_var + "_H", "dodgerblue", label="CSF (HYSPLIT)")
+		_scatter_qf(ax, data_csf, age_H, flux_var + "_H", "dodgerblue", suffix="_H", label="CSF (HYSPLIT)")
 		if flux_var + "_O" in data_csf.columns:
-			_scatter_qf(ax, data_csf, "age_hours_O", flux_var + "_O", "limegreen", label="CSF (Optimized)")
+			_scatter_qf(ax, data_csf, age_O, flux_var + "_O", "limegreen", suffix="_O", label="CSF (Optimized)")
 
 		# --- Secondary x-axis: transport distance [km] ---
+		# vvv: fixed undefined variable age_H (was referenced before assignment)
 		age_km_col = "age_km_H" if "age_km_H" in data_csf.columns else "age_km"
 		if age_km_col in data_csf.columns:
 			_df = (data_csf[[age_H, age_km_col]].dropna()
@@ -230,21 +229,27 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 			ax_km.set_xlabel("Transport distance [km]")
 			ax_km.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}"))
 
-		# --- PSS ratio per row (Step 1, from trop_csf) ---
-		if trop_csf is not None and "pss_ratio" in trop_csf.columns:
+		# --- PSS ratio per row (Step 1, from data_csf) ---
+		# vvv: column name uses nox_suffix (e.g. "pss_ratio_O"), not bare "pss_ratio"
+		pss_col = "pss_ratio" + nox_suffix
+		if pss_col in data_csf.columns:
 			ax_pss = ax.twinx()
-			ax_pss.scatter(trop_csf["age_hours_O"], trop_csf["pss_ratio"], marker="^", color="purple", s=12, label="NOx/NO2 (PSS)", zorder=4)
+			ax_pss.scatter(data_csf[age_O], data_csf[pss_col], marker="^", color="purple", s=12, label="NOx/NO2 (PSS)", zorder=4)
 			ax_pss.set_ylabel("NOx/NO2 PSS ratio", color="purple")
 			ax_pss.tick_params(axis="y", colors="purple")
 
-		# --- Step 4: fitted exponential decay curve (per-row, from trop_csf) ---
-		if trop_csf is not None and "flux_nox_fit" in trop_csf.columns:
-			fit = trop_csf[["age_hours_O", "flux_nox_fit"]].dropna().sort_values("age_hours_O")
+		# --- Step 4: fitted exponential decay curve (per-row, from data_csf) ---
+		# vvv: column name uses nox_suffix (e.g. "flux_nox_fit_O"), not bare "flux_nox_fit"
+		fit_col = "flux_nox_fit" + nox_suffix
+		age_col_nox = "age_hours" + nox_suffix
+		if fit_col in data_csf.columns:
+			fit = data_csf[[age_col_nox, fit_col]].dropna().sort_values(age_col_nox)
 			if not fit.empty:
-				ax.plot(fit["age_hours_O"], fit["flux_nox_fit"],
+				ax.plot(fit[age_col_nox], fit[fit_col],
 						color="orangered", lw=1.2, linestyle="--", label="NOx fit (Step 4)")
 
 		# --- NOx workflow scalar results (Steps 2–5) ---
+		# vvv: nox_result keys are now unsuffixed (S3 fix); check "status" not "status_O"
 		if nox_result and nox_result.get("status") == "ok":
 			age_pss_hr = nox_result["age_at_PSS_s"] / 3600.
 			ax.axvline(age_pss_hr, color="purple", linestyle="dotted", lw=1.0, label="PSS point")
@@ -261,7 +266,7 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 			k_txt  = f"{k_lbl}= {k_val:.2e} s⁻¹\n" if k_val and not np.isnan(k_val) else ""
 			info   = (f"── NOx workflow (opt {opt}) ──\n"
 					  f"PSS ratio= {nox_result['pss_ratio']:.3f}  (Step 2)\n"
-					  f"NOx@PSS=  {nox_result['flux_nox_PSS']:.3f} {flux_unit}	(Step 3)\n"
+					  f"NOx@PSS=  {nox_result['flux_nox_PSS']:.3f} {flux_unit}  (Step 3)\n"
 					  f"{oh_txt}{k_txt}"
 					  f"NOx source= {nox_result['flux_nox_source']:.3f} {flux_unit}  (Step 4)")
 			ax.text(0.02, 0.97, info, transform=ax.transAxes, fontsize=5.5,
@@ -269,8 +274,9 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 					bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="orangered", alpha=0.8))
 
 		# --- Optional NOx lifetime fit (legacy CFG flag) ---
+		# NOTE: this branch (o_calc_nox=True) uses _H-suffixed columns directly on data_csf
 		if CFG["SATE_INFO"][0] == "trop" and CFG.get("o_calc_nox"):
-			_scatter_qf(ax, data_csf, "age_hours_H", "flux_nox_H", "orangered", label="NOx flux (HYSPLIT)")
+			_scatter_qf(ax, data_csf, age_H, "flux_nox_H", "orangered", suffix="_H", label="NOx flux (HYSPLIT)")
 			x = np.arange(0., 6., 0.1)
 			ax.plot(x, FN._nox_lifetime(x, data_csf["emis_nox_H"].iloc[0],
 										data_csf["t_pss_H"].iloc[0]), color="orangered")
@@ -297,9 +303,9 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 		ax.set_ylabel(f"Wind speed [m/s]")
 
 		# --- WIND ---
-		_scatter_qf(ax, data_csf, "age_hours_H", "wso_H", "dodgerblue", label="CSF (HYSPLIT)")
+		_scatter_qf(ax, data_csf, "age_hours_H", "wso_H", "dodgerblue", suffix="_H", label="CSF (HYSPLIT)")
 		if "age_hours_O" in data_csf.columns:
-			_scatter_qf(ax, data_csf, "age_hours_O", "wso_O", "limegreen", label="CSF (Optimized)")
+			_scatter_qf(ax, data_csf, "age_hours_O", "wso_O", "limegreen", suffix="_O", label="CSF (Optimized)")
 
 	ax.legend(fontsize=6, loc="upper right")
 
@@ -310,36 +316,38 @@ def _plot_flux_vs_time(ax, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_u
 
 def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump,
 			  sate, flux_unit, o_plot_wddiff, dfout,
-			  cems_nox=None, true_tdump=None, trop_csf=None, nox_result=None, data_true_sampled=[None]):
+			  cems_nox=None, true_tdump=None, nox_result=None, data_true_sampled=[None]):
 	"""
 	Compose the three-panel CSF figure and save to dfout + '.png'.
 
 	Parameters
 	----------
-	trop_csf   : pd.DataFrame or None  — output of run_nox_workflow (per-row NOx columns)
-	nox_result : dict or None		   — scalar results from run_nox_workflow
+	data_csf   : pd.DataFrame  — output of run_nox_workflow (per-row NOx columns suffixed)
+	nox_result : dict or None  — scalar results from run_nox_workflow (keys unsuffixed)
 	"""
 	mpl.rcParams['font.size'] = 6.
-	fig, ax = plt.subplots(nrows=9, ncols=12, figsize=(7.24, 5.00), gridspec_kw=dict(width_ratios=[1,1,1, 0.1, 1,1,1,1,1,1,1,1], height_ratios=[1,1,1,1, 0.1, 1,1,1,1]))
+	fig, ax = plt.subplots(nrows=9, ncols=12, figsize=(7.24, 5.00), gridspec_kw=dict(width_ratios=[1,1,1, 0.1, 1,1,1,1,1,1,1,1], height_ratios=[1,1,1,1, 0.05, 1,1,1,1]))
 	plt.subplots_adjust(left=0.07, bottom=0.07, right=0.930, top=0.93, wspace=0, hspace=0)
 	for j in range(9):
 		for i in range(12):
 			ax[j, i].axis("off")
 
-	gs		= ax[0, 0].get_gridspec()
-	ax_map	= fig.add_subplot(gs[0:4, 0:3])
-	ax_flux1 = fig.add_subplot(gs[5:7,	0:12])
+	gs		 = ax[0, 0].get_gridspec()
+	ax_map	 = fig.add_subplot(gs[0:4, 0:3])
+	ax_flux1 = fig.add_subplot(gs[5:7, 0:12])
 	ax_flux2 = fig.add_subplot(gs[7:9, 0:12])
-	pp_list = [(r, c) for r in range(4) for c in range(4, 12)]	 # 4×8 = 32 Gaussian slots
-	style	= _satellite_style(CFG["SATE_INFO"][0])
+	pp_list  = [(r, c) for r in range(4) for c in range(4, 12)]	# 4×8 = 32 Gaussian slots
+	style    = _satellite_style(CFG["SATE_INFO"][0])
 
-	# Strip _H suffix for map/Gaussian panels (they use plain column names)
+	# Strip _H suffix for map and Gaussian transect panels, which use bare column names internally.
+	# _O columns keep their suffix (only _H is stripped), so a3_O, a4_O etc. remain accessible.
 	data_csf_H = data_csf.rename(columns=lambda c: c[:-2] if c.endswith("_H") else c)
 
 	_plot_map(ax_map, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=true_tdump)
 	_plot_gaussian(ax, pp_list, CFG, data_csf, data_sampled, data_true_sampled, style)
-	_plot_flux_vs_time(ax_flux1, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_unit, style, var_to_plot='nox')
-	_plot_flux_vs_time(ax_flux2, CFG, data_csf, trop_csf, nox_result, cems_nox, flux_unit, style, var_to_plot='etc')
+	# vvv: pass nox_suffix from CFG so _plot_flux_vs_time reads the correct per-row NOx columns
+	_plot_flux_vs_time(ax_flux1, CFG, data_csf, nox_result, cems_nox, flux_unit, style, var_to_plot='nox', nox_suffix=CFG["NOX_SUFFIX"])
+	_plot_flux_vs_time(ax_flux2, CFG, data_csf, nox_result, cems_nox, flux_unit, style, var_to_plot='etc', nox_suffix=CFG["NOX_SUFFIX"])
 
-	fig.savefig(dfout + ".png", dpi=400)
+	fig.savefig(dfout + ".png", dpi=200)
 	plt.close("all")

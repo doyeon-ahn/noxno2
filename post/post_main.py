@@ -27,8 +27,8 @@ from post_plot_vsCEMS import plot_no2_vs_cems
 # CONFIG
 # =============================================================================
 CFG = {
-	'CSF_PRCS_VER':  CT.PRCS_VER['csf'],
 	'POST_PRCS_VER': CT.PRCS_VER['post'],
+	'CSF_PRCS_VER':  CT.PRCS_VER['csf'],
 	'TARGET_INFO':	 CT.df_target,
 
 	# Facility IDs to process
@@ -36,17 +36,17 @@ CFG = {
 
 	# CSF column names (suffix _H = HYSPLIT trajectory)
 	#'FLUX_COL': 'flux_no2_H',
-	'FLUX_COL': 'flux_nox_fit',
-	'AGE_COL':	'age_hours_H',
-	'QF_COL':	'QF_gauss_abs_H',
+	'FLUX_COL': 'flux_nox_fit_O',
+	'AGE_COL':	'age_hours_O',
+	'QF_COL':	'QF_gauss_abs_O',
 
 	# Additional quality filters applied after the primary QF gate.
 	# Each tuple: (column, vmin, vmax)
 	'QF_EXTRA': [
-		('nobs_H',		   25.,   9999.),
-		('u_std_H',		 -9999.,	1.0),
-		('v_std_H',		 -9999.,	1.0),
-		('rsq_detrend_H',  0.5,   9999.),
+		('nobs_O',		   50.,   9999.),
+		#('u_std_H',		 -9999.,	1.0),
+		#('v_std_H',		 -9999.,	1.0),
+		('rsq_detrend_O',  0.6,   9999.),
 	],
 
 	# CEMS matching: max allowed |t_emission - cems_hour| in hours.
@@ -327,9 +327,9 @@ if __name__ == '__main__':
 
 	# 2. Quality filter
 	print (csf)
-	csf = _apply_qf(csf, CFG)
-	csf=	csf.loc[csf['age_hours_H']<0.2].reset_index(drop=True)
-	csf=	csf.loc[(csf['flux_nox_fit'] >= csf['flux_nox_fit'].quantile(0.00)) & (csf['flux_nox_fit'] <= csf['flux_nox_fit'].quantile(0.95))].reset_index(drop=True)
+	csf= 	_apply_qf(csf, CFG)
+	csf=	csf.loc[csf[CFG['AGE_COL']]<0.2].reset_index(drop=True)
+	csf=	csf.loc[(csf[CFG['FLUX_COL']] >= csf[CFG['FLUX_COL']].quantile(0.00)) & (csf[CFG['FLUX_COL']] <= csf[CFG['FLUX_COL']].quantile(0.98))].reset_index(drop=True)
 	# 3. Match each row to its temporally corresponding CEMS record
 	csf = _match_cems(csf, target, CFG)
 

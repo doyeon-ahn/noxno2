@@ -1,5 +1,5 @@
 # =============================================================================
-# csf_nox.py  —  GEOS-CF-driven NOx emission workflow
+# csf_geoscf_nox.py  —	GEOS-CF-driven NOx emission workflow
 # Drop-in companion to csf_prcs.py (v20260324)
 # =============================================================================
 # Implements the five-step PSS back-calculation workflow using GEOS-CF fields:
@@ -19,16 +19,18 @@
 #	oxi_inst_1hr_glo_L1440x721_v72	→  OH  [mol mol-1]	(for Option B k_loss)
 #
 # All GEOS-CF files are expected to follow the v2 file-naming convention:
-#	GEOS.cf.ana.<collection>.<yyyyMMdd_hhmmz>.RX.nc4
+#	GEOS.cf.ana.<collection>.<yyyyMMdd_hhmmz>.RX.nc4	# R1: the first revision of the file; Reads whatever revision version exist in dir
 # and be reachable via the NCCS OPeNDAP or local mirror path CT.d_geoscf.
 # =============================================================================
 
-import os, glob
+import os, IPython, glob
+import math
 import numpy as np
 import pandas as pd
 import xarray as xr
 from scipy.optimize import curve_fit
-# vvv S: removed duplicate `from scipy.optimize import curve_fit` and unused `math`, `linregress`, `IPython`
+from scipy.stats import linregress
+from scipy.optimize import curve_fit
 
 # ---------------------------------------------------------------------------
 # Assumed import of project constants (same as csf_prcs.py)
@@ -74,7 +76,7 @@ def _geoscf_filepath(collection, timestamp_utc, d_geoscf, mode="ana"):
 	-------
 	str  full file path
 	"""
-	# Round DOWN to nearest collection hour (tavg files are stamped at hh:30, inst files at hh:00)
+	# Round DOWN to nearest collection hour (tavg files are stamped at hh:30, inst files at hh:00; we just match the hour for look-up)
 	ts	  = pd.Timestamp(timestamp_utc)
 	hh	  = ts.floor("h").strftime("%H")
 	mm	  = "30" if "tavg" in collection else "00"
@@ -223,7 +225,7 @@ def _o3_number_density(o3_molmol, T_K, P_Pa):
 	# Ideal gas:  n/V = P / (kB * T)   with kB = 1.380649e-23 J K-1
 	kB = 1.380649e-23					 # J K-1
 	n_air_m3 = P_Pa / (kB * T_K)		# molec m-3
-	n_air_cm3 = n_air_m3 * 1e-6		# molec cm-3
+	n_air_cm3 = n_air_m3 * 1e-6			# molec cm-3
 	return o3_molmol * n_air_cm3
 
 
@@ -269,15 +271,14 @@ def _calc_pss_ratio_row(lat, lon, timestamp_utc, T_K, d_geoscf):
 	f_xgc = _geoscf_filepath("xgc_tavg_1hr_glo_L1440x721_slv", ts, d_geoscf)
 	cosz  = _geoscf_interp_point(f_xgc, "COSZ", lat, lon)
 
-	# vvv S10: open met file once; use for both T fallback and PS
-	f_met = _geoscf_filepath("met_tavg_1hr_glo_L1440x721_slv", ts, d_geoscf)
-
 	# --- Temperature: prefer tdump value, fall back to GEOS-CF met ---
 	if np.isnan(T_K):
-		T_K = _geoscf_interp_point(f_met, "T", lat, lon, lev_idx=0)
+		f_met = _geoscf_filepath("met_tavg_1hr_glo_L1440x721_slv", ts, d_geoscf)
+		T_K   = _geoscf_interp_point(f_met, "T", lat, lon, lev_idx=0)
 
 	# --- Surface pressure for number density ---
-	P_Pa = _geoscf_interp_point(f_met, "PS", lat, lon)
+	f_met  = _geoscf_filepath("met_tavg_1hr_glo_L1440x721_slv", ts, d_geoscf)
+	P_Pa   = _geoscf_interp_point(f_met, "PS", lat, lon)
 	if np.isnan(P_Pa):
 		P_Pa = _P0_PA	# fallback to standard atmosphere
 
@@ -301,22 +302,20 @@ def _calc_pss_ratio_row(lat, lon, timestamp_utc, T_K, d_geoscf):
 	}
 
 
-# vvv S4: renamed parameter sfx → suffix throughout step1, step2, step3 for consistency with step4 and run_nox_workflow
-def step1_pss_ratio(trop_csf, tdump, d_geoscf, suffix="_O", rsq_min=0.7, d_gap_max=50.0, nobs_min=5):
+def step1_pss_ratio(trop_csf, tdump, d_geoscf, sfx="_O", rsq_min=0.7, d_gap_max=50.0, nobs_min=5):
 	"""
 	Step 1: Compute the PSS (NOx/NO2) ratio at every trajectory point
 	using GEOS-CF j_NO2, O3, and T.
 
 	Adds columns to trop_csf (in-place copy):
-		pss_ratio{s}, jno2{s}, k_no_o3{s}, o3_molmol{s}, o3_nd{s},
-		T_K_geoscf{s}, cosz{s}, P_Pa{s}
+		pss_ratio, jno2, k_no_o3, o3_molmol, o3_nd, T_K_geoscf, cosz, P_Pa
 
 	Parameters
 	----------
 	trop_csf   : pd.DataFrame	output of _calc_csf (with _O or _H suffix)
 	tdump	   : pd.DataFrame	true_tdump or original tdump
 	d_geoscf   : str			CT.d_geoscf
-	suffix	   : str			column suffix used in trop_csf ("_O" or "_H")
+	sfx			: str			column suffix used in trop_csf ("_O" or "_H")
 	rsq_min    : float			minimum rsq_detrend for valid flux rows
 	d_gap_max  : float			maximum d_gap [%] for valid flux rows
 	nobs_min   : int			minimum nobs for valid flux rows
@@ -325,20 +324,20 @@ def step1_pss_ratio(trop_csf, tdump, d_geoscf, suffix="_O", rsq_min=0.7, d_gap_m
 	-------
 	trop_csf : pd.DataFrame   with PSS columns appended
 	"""
-	s = suffix	# vvv S4: single alias used throughout
-	pss_cols = [i+s for i in ["pss_ratio", "jno2", "k_no_o3", "o3_molmol", "o3_nd", "T_K_geoscf", "cosz", "P_Pa"]]
+	pss_cols = [i+sfx for i in ["pss_ratio", "jno2", "k_no_o3", "o3_molmol", "o3_nd", "T_K_geoscf", "cosz", "P_Pa"]]
 	for c in pss_cols:
 		trop_csf[c] = np.nan
 
-	lat_col  = f"lat_a3{s}"
-	lon_col  = f"lon_a3{s}"
-	time_col = f"time_tag{s}"
+	# Merge lat/lon/time_tag from tdump if not already present
+	lat_col  = f"lat_a3{sfx}"
+	lon_col  = f"lon_a3{sfx}"
+	time_col = f"time_tag{sfx}"
 
 	for idx, row in trop_csf.iterrows():
 		lat  = row.get(lat_col,  np.nan)
 		lon  = row.get(lon_col,  np.nan)
 		time = row.get(time_col, pd.NaT)
-		T_K  = row.get(f"temp{s}", np.nan)	 # from tdump["temp"]
+		T_K  = row.get(f"temp{sfx}", np.nan)   # from tdump["temp"]
 
 		if any(pd.isna(v) for v in [lat, lon, time]):
 			continue
@@ -346,14 +345,14 @@ def step1_pss_ratio(trop_csf, tdump, d_geoscf, suffix="_O", rsq_min=0.7, d_gap_m
 			T_K = np.nan   # will trigger GEOS-CF fallback inside helper
 
 		res = _calc_pss_ratio_row(lat, lon, time, T_K, d_geoscf)
-		trop_csf.loc[idx, "pss_ratio"+s]   = res["pss_ratio"]
-		trop_csf.loc[idx, "jno2"+s]		   = res["jno2"]
-		trop_csf.loc[idx, "k_no_o3"+s]	   = res["k_no_o3"]
-		trop_csf.loc[idx, "o3_molmol"+s]   = res["o3_molmol"]
-		trop_csf.loc[idx, "o3_nd"+s]	   = res["o3_nd"]
-		trop_csf.loc[idx, "T_K_geoscf"+s]  = res["T_K"]
-		trop_csf.loc[idx, "cosz"+s]		   = res["cosz"]
-		trop_csf.loc[idx, "P_Pa"+s]		   = res["P_Pa"]
+		trop_csf.loc[idx, "pss_ratio"+sfx]	= res["pss_ratio"]
+		trop_csf.loc[idx, "jno2"+sfx]		= res["jno2"]
+		trop_csf.loc[idx, "k_no_o3"+sfx]	= res["k_no_o3"]
+		trop_csf.loc[idx, "o3_molmol"+sfx]	= res["o3_molmol"]
+		trop_csf.loc[idx, "o3_nd"+sfx]		= res["o3_nd"]
+		trop_csf.loc[idx, "T_K_geoscf"+sfx]	= res["T_K"]
+		trop_csf.loc[idx, "cosz"+sfx]		= res["cosz"]
+		trop_csf.loc[idx, "P_Pa"+sfx]		= res["P_Pa"]
 
 	return trop_csf
 
@@ -361,22 +360,20 @@ def step1_pss_ratio(trop_csf, tdump, d_geoscf, suffix="_O", rsq_min=0.7, d_gap_m
 # =============================================================================
 # STEP 2 — Identify the PSS point (quality screen + flux peak)
 # =============================================================================
-# vvv S4: renamed parameter sfx → suffix
-def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d_gap_max=50.0, nobs_min=5):
+def step2_find_pss_point(trop_csf, sfx="_O", residual_tol=2.0, rsq_min=0.7, d_gap_max=50.0, nobs_min=5):	 # fallback only
 	"""
 	Step 2: Screen flux values by quality flags and locate the trajectory
 	point where flux_no2 peaks	→  this is the PSS point.
 
 	Quality criteria (editable via arguments):
 		rsq_detrend{suffix}  >=  rsq_min		(Gaussian fit quality)
-		d_gap{suffix}		 <=  d_gap_max [%]	(sampling gap fraction)
-		nobs{suffix}		 >=  nobs_min		(number of pixels)
+		d_gap{suffix}		 <=  d_gap_max [%]	 (sampling gap fraction)
+		nobs{suffix}		 >=  nobs_min		  (number of pixels)
 
 	Parameters
 	----------
 	trop_csf			: pd.DataFrame	output of step1_pss_ratio
 	suffix				: str			"_O" or "_H"
-	residual_tol		: float			outlier rejection threshold (MAD multiplier)
 	rsq_min				: float
 	d_gap_max			: float
 	nobs_min			: int
@@ -387,52 +384,47 @@ def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d
 	pss_row		 : pd.Series	  row where flux_no2 is maximum (PSS point)
 	pss_tdump_id : int			  tdump_id of the PSS point
 	"""
-	s = suffix	# vvv S4: single alias used throughout
 
 	## 2a. Quality filtering
-	mask = trop_csf['flux_no2'+s].notna() & (trop_csf['flux_no2'+s] > 0)
-	mask &= trop_csf['QF_gauss_abs'+s] == 0
+	mask = trop_csf['flux_no2'+sfx].notna() & (trop_csf['flux_no2'+sfx] > 0)
+	mask &= trop_csf['QF_gauss_abs'+sfx] == 0
 	trop_csf_qc = trop_csf.loc[mask].sort_values("tdump_id").reset_index(drop=True)
 
-	if trop_csf_qc.empty or 'flux_no2'+s not in trop_csf_qc.columns:
-		print(f"  [step2] No valid flux rows after QC (suffix={s})")
+	if trop_csf_qc.empty or 'flux_no2'+sfx not in trop_csf_qc.columns:
+		print(f"  [step2] No valid flux rows after QC (sfx={sfx})")
 		return trop_csf_qc, pd.Series(dtype=float), np.nan
 
-	## 2b. Identify the primary NO2 plume by fitting a log-normal pulse to
-	##	   (age, flux) and iteratively rejecting outliers with large residuals
-	def _fit_primary_plume(flux_vals, age_hrs, residual_tol=2.0):
+	## 2b. Identify the primary NO2 plume by fitting a log-normal pulse to (age,flux) and interatively rejecting outliers with large residuals
+	def _fit_primary_plume(flux, age, residual_tol=2.0):
 		"""
-		Robust to:
+		This is robust to:
 		  - gaps in tdump_id (fit is global, not point-by-point)
 		  - spurious large flux from a separate downwind source (outlier rejection)
 		  - noise on individual transects (least-squares fit averages over all)
 		Parameters
 		----------
-		flux_vals	 : np.ndarray  shape (N,) QC-screened flux, ascending age order
-		age_hrs		 : np.ndarray  shape (N,) transport age [hours], same order
-		residual_tol : float	   points with |residual| > residual_tol * MAD are
-								   flagged as outside primary plume; lower = stricter
+		flux		 : np.ndarray  shape (N,) QC-screened flux, ascending age order
+		age			 : np.ndarray  shape (N,) transport age [hours], same order
+		residual_tol : float	   points with |residual| > residual_tol * MAD of residuals are flagged as outside primary plume; lower = stricter outlier rejection (default 2.0)
 		Returns
 		-------
 		in_primary	 : np.ndarray  bool mask, shape (N,)  True = primary plume
 		t_peak_fit	 : float	   fitted peak age [hours]	(PSS point estimate)
 		fit_ok		 : bool		   False if fitting failed (caller falls back to argmax)
 		"""
-		# Log-normal pulse: symmetric in log-time, right-skewed in linear time
+		# Log-normal pulse function
 		def _lognormal_pulse(t, A, t_peak, sigma):
+			"""
+			Unimodal log-normal pulse shape for NO2 flux vs. transport age. f(t) = A * exp( -(ln(t / t_peak))^2 / (2 * sigma^2) ). Defined only for t > 0; returns 0 elsewhere.
+			"""
 			t	  = np.asarray(t, dtype=float)
 			out   = np.zeros_like(t)
 			valid = t > 0
 			out[valid] = A * np.exp(-(np.log(t[valid] / t_peak))**2 / (2 * sigma**2))
 			return out
 
-		# vvv S2 (bug): fixed variable names — was using undefined `flux`, `age`, `n`
-		n	 = len(flux_vals)
-		flux = flux_vals
-		age  = age_hrs
-
 		# Need at least 4 points to fit 3 parameters with a degree of freedom
-		if n < 4:
+		if len(flux) < 4:
 			return np.ones(n, dtype=bool), age[np.argmax(flux)], False
 
 		# Initial parameter guess
@@ -443,15 +435,12 @@ def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d
 
 		# Fit a log-normal pulse to all points
 		try:
-			popt, _ = curve_fit(_lognormal_pulse, age, flux, p0=[A0, t_peak0, sigma0],
-								bounds=([0, 0.01, 0.05], [A0 * 5, age.max() * 1.5, 3.0]),
-								maxfev=5000)
+			popt, _ = curve_fit( _lognormal_pulse, age, flux, p0=[A0, t_peak0, sigma0], bounds=([0, 0.01, 0.05], [A0 * 5, age.max() * 1.5, 3.0]), maxfev=5000, )
 			A_fit, t_peak_fit, sigma_fit = popt
 		except RuntimeError:
 			return np.ones(n, dtype=bool), age[np.argmax(flux)], False
 
-		# Iterative outlier rejection: flag points whose residual exceeds
-		# residual_tol × MAD (median absolute deviation) of all residuals.
+		# Iterative outlier rejection: flag points whose residual exceeds residual_tol × MAD (median absolute deviation) of all residuals.
 		residuals	= flux - _lognormal_pulse(age, *popt)
 		mad			= np.median(np.abs(residuals - np.median(residuals)))
 		in_primary	= np.abs(residuals) <= residual_tol * (mad + 1e-9)
@@ -459,9 +448,7 @@ def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d
 		# Refit on inliers only if any points were rejected
 		if not np.all(in_primary) and in_primary.sum() >= 4:
 			try:
-				popt2, _ = curve_fit(_lognormal_pulse, age[in_primary], flux[in_primary],
-									 p0=popt, bounds=([0, 0.01, 0.05], [A_fit * 5, age.max() * 1.5, 3.0]),
-									 maxfev=5000)
+				popt2, _ = curve_fit( _lognormal_pulse, age[in_primary], flux[in_primary], p0=popt, bounds=([0, 0.01, 0.05], [A_fit * 5, age.max() * 1.5, 3.0]), maxfev=5000, )
 				A_fit, t_peak_fit, sigma_fit = popt2
 				residuals  = flux - _lognormal_pulse(age, *popt2)
 				mad		   = np.median(np.abs(residuals - np.median(residuals)))
@@ -471,14 +458,9 @@ def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d
 
 		return in_primary, float(t_peak_fit), True
 
-	# vvv S9: pass residual_tol from the outer function parameter instead of hardcoding 2.0
-	in_primary, t_peak_fit, fit_ok = _fit_primary_plume(
-		flux_vals	 = trop_csf_qc['flux_no2'+s].values,
-		age_hrs		 = np.abs(trop_csf_qc['age_hours'+s].values),
-		residual_tol = residual_tol,
-	)
+	in_primary, t_peak_fit, fit_ok	= _fit_primary_plume(flux= trop_csf_qc['flux_no2'+sfx].values, age= np.abs(trop_csf_qc['age_hours'+sfx].values), residual_tol=2.0)
 
-	trop_csf_qc["step2_in_primary_plume"+s] = in_primary
+	trop_csf_qc["step2_in_primary_plume"+sfx] = in_primary
 	n_excl = (~in_primary).sum()
 	if n_excl > 0:
 		print(f"  [step2] Outlier rejection: excluded {n_excl}/{len(trop_csf_qc)} rows outside primary plume fit  (fit_ok={fit_ok})")
@@ -493,61 +475,56 @@ def step2_find_pss_point(trop_csf, suffix="_O", residual_tol=2.0, rsq_min=0.7, d
 
 	## 2c. Find PSS point: data row closest to fitted t_peak (or argmax if fit failed)
 	if fit_ok:
-		age_abs		= np.abs(primary['age_hours'+s].values)
+		age_abs		= np.abs(primary['age_hours'+sfx].values)
 		closest_idx = primary.index[np.argmin(np.abs(age_abs - t_peak_fit))]
 		pss_row		= trop_csf_qc.loc[closest_idx]
 	else:
-		pss_row = primary.loc[primary['flux_no2'+s].idxmax()]
+		pss_row = primary.loc[primary['flux_no2'+sfx].idxmax()]
 
 	pss_tdump_id = pss_row.get("tdump_id", np.nan)
 	print(f"  [step2] PSS point: tdump_id={pss_tdump_id}  "
-		  f"flux_no2={pss_row['flux_no2'+s]:.4f} tNO2/hr  "
-		  f"age_hrs={pss_row.get('age_hours'+s, np.nan):.2f}  "
+		  f"flux_no2={pss_row['flux_no2'+sfx]:.4f} tNO2/hr	"
+		  f"age_hrs={pss_row.get('age_hours'+sfx, np.nan):.2f}	"
 		  f"t_peak_fit={t_peak_fit:.2f} hr	fit_ok={fit_ok}")
 
 	return trop_csf_qc, pss_row, pss_tdump_id
 
-
 # =============================================================================
 # STEP 3 — Convert NO2 flux → NOx flux at the PSS point
 # =============================================================================
-def step3_no2_to_nox_flux(pss_row, suffix):
+def step3_no2_to_nox_flux(pss_row, sfx):
 	"""
-	Step 3: Convert NO2 mass flux at the PSS point to NOx mass flux.
+	Step 3: Multiply the NO2 flux at the PSS point by the PSS (NOx/NO2) ratio to obtain the NOx flux at the PSS point.
+
+		flux_nox_PSS = flux_no2_PSS  ×	(NOx/NO2)_PSS
 
 	Parameters
 	----------
-	pss_row  : pd.Series   row returned by step2_find_pss_point
-	suffix	 : str		   "_O" or "_H"
+	pss_row				: pd.Series   row returned by step2_find_pss_point
+	suffix				: str
+	flux_col_template	: str
 
 	Returns
 	-------
-	flux_nox_PSS : float   [tNOx/hr]
-	pss_ratio	 : float   NOx/NO2 molar ratio at PSS
+	flux_nox_PSS : float   [tNOx/hr]  (same units as flux_no2 in _calc_csf)
+	pss_ratio	 : float   NOx/NO2 at PSS
 	"""
-	_MW_NO2 = 46.0055	# g mol-1
-	_MW_NO	= 30.0061	# g mol-1
-
-	s = suffix
-	flux_no2  = float(pss_row.get('flux_no2'+s, np.nan))
-	pss_ratio = float(pss_row.get("pss_ratio"+s, np.nan))
+	flux_no2   = float(pss_row.get('flux_no2'+sfx, np.nan))
+	pss_ratio  = float(pss_row.get("pss_ratio"+sfx, np.nan))
 
 	if np.isnan(flux_no2) or np.isnan(pss_ratio):
-		print(f"  [step3] Cannot compute NOx flux: flux_no2={flux_no2:.4f}	pss_ratio={pss_ratio:.4f}")
+		print(f"  [step3] Cannot compute NOx flux: " f"flux_no2={flux_no2:.4f}	pss_ratio={pss_ratio:.4f}")
 		return np.nan, np.nan
 
-	# Mole fraction of NO within the NOx pool at PSS
-	# pss_ratio = (NO + NO2)/NO2  -->  NO/NO2 = pss_ratio - 1
-	# f_NO = (NO/NO2) / (NOx/NO2) = (pss_ratio - 1) / pss_ratio
-	f_NO	   = (pss_ratio - 1.0) / pss_ratio	# NO mole fraction in NOx
-	MW_NOx_eff = f_NO * _MW_NO + (1.0 - f_NO) * _MW_NO2
+	# Unit note: flux_no2 is in tNO2/hr (from _calc_csf).
+	# pss_ratio is dimensionless (NOx/NO2 by mole).
+	# Because MW(NOx) ≈ MW(NO2) in the PSS approximation (NO2 dominates),
+	# multiplying by the molar ratio gives tNOx/hr to good approximation.
+	# For a strict mass conversion: multiply additionally by MW_NO/MW_NO2
+	# for the NO fraction; here we follow the standard CSF convention.
+	flux_nox_PSS = flux_no2 * pss_ratio
 
-	# Mass conversion: tNO2/hr → tNOx/hr
-	flux_nox_PSS = flux_no2 * pss_ratio * (MW_NOx_eff / _MW_NO2)
-
-	print(f"  [step3] flux_no2_PSS={flux_no2:.4f} tNO2/hr  pss_ratio={pss_ratio:.3f}"
-		  f"  f_NO={f_NO:.3f}  MW_NOx_eff={MW_NOx_eff:.2f} g/mol"
-		  f"  → flux_nox_PSS={flux_nox_PSS:.4f} tNOx/hr")
+	print(f"  [step3] flux_no2_PSS = {flux_no2:.4f} tNO2/hr  × pss_ratio = {pss_ratio:.3f}  → flux_nox_PSS = {flux_nox_PSS:.4f} tNOx/hr")
 
 	return flux_nox_PSS, pss_ratio
 
@@ -585,8 +562,8 @@ def _get_oh_column(lat, lon, timestamp_utc, d_geoscf):
 
 	# Mass-weighted column average OH number density
 	kB	  = 1.380649e-23
-	n_air = P_col / (kB * T_col) * 1e-6		  # molec cm-3	(72,)
-	oh_nd = oh_col * n_air					   # molec cm-3  (72,)
+	n_air = P_col / (kB * T_col) * 1e-6			  # molec cm-3	(72,)
+	oh_nd = oh_col * n_air						   # molec cm-3  (72,)
 	# weights = pressure thickness
 	oh_avg = np.average(oh_nd, weights=np.abs(delp_col))
 	return float(oh_avg)
@@ -625,7 +602,7 @@ def _k_loss_nox(T_K, oh_nd_cm3):
 	k_f  = k0 / (1.0 + k0 / kinf)
 	N	 = 1.0 + (np.log10(k0 / kinf)) ** 2
 	k_NO2_OH = k_f * Fc ** (1.0 / N)		  # [cm3 molec-1 s-1]
-	return k_NO2_OH * oh_nd_cm3			   # [s-1]
+	return k_NO2_OH * oh_nd_cm3				   # [s-1]
 
 
 def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix="_O", flux_col_template="flux_no2{s}", option="B"):
@@ -662,7 +639,7 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix=
 		option			  : str    "A" or "B"
 		oh_nd			  : float  [molec cm-3]  (nan for option A)
 	"""
-	age_col  = f"age_hours{suffix}"
+	age_col = f"age_hours{suffix}"
 	flux_col = flux_col_template.format(s=suffix)
 
 	age_pss_hr = float(pss_row.get(age_col, np.nan))
@@ -721,10 +698,10 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix=
 		result.update({"flux_nox_source": flux_nox_source,
 					   "k_eff":			  k_eff,
 					   "flux_nox_fit":	  _eval_fit_curve(k_eff)})
-		print(f"  [step4-A] k_eff={k_eff:.2e} s-1  age_PSS={age_pss_s/3600:.2f} hr	flux_nox_source={flux_nox_source:.4f} tNOx/hr")
+		print(f"  [step4-A] k_eff={k_eff:.2e} s-1  age_PSS={age_pss_s/3600:.2f} hr  flux_nox_source={flux_nox_source:.4f} tNOx/hr")
 
 	# ------------------------------------------------------------------ #
-	# Option B: analytical — k_loss from GEOS-CF [OH]					  #
+	# Option B: analytical — k_loss from GEOS-CF [OH]					 #
 	# ------------------------------------------------------------------ #
 	elif option == "B":
 		lat  = float(pss_row.get(f"lat_a3{suffix}", np.nan))
@@ -752,7 +729,7 @@ def step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix=
 
 
 # =============================================================================
-# MAIN CALLER — run after _calc_csf / _calc_qf_gauss in _csf_prcs()
+# MAIN CALLER — drop into _csf_prcs() after step 2i (CSV saved)
 # =============================================================================
 def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a="B", residual_tol=2.0):
 	"""
@@ -763,9 +740,9 @@ def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a=
 		)
 
 	trop_csf gains per-row columns from Step 1 (pss_ratio, jno2, k_no_o3,
-	o3_molmol, o3_nd, T_K_geoscf, cosz, P_Pa — all suffixed) and flag columns
-	from Step 2 (step2_qc_pass{suffix}, step2_is_pss_point{suffix}).
-	All scalar step results (Steps 2–5) are returned in nox_result only.
+	o3_molmol, o3_nd, T_K_geoscf, cosz, P_Pa) and a QC/PSS flag column from
+	Step 2 (step2_qc_pass, step2_is_pss_point).  All scalar step results
+	(Steps 2–5) are returned in nox_result only — not broadcast as columns.
 
 	Returns
 	-------
@@ -776,14 +753,13 @@ def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a=
 	"""
 	print("  [NOx workflow] Starting 5-step PSS back-calculation ...")
 
-	# Step 1 — per-row PSS fields (adds suffixed columns directly to trop_csf)
-	trop_csf = step1_pss_ratio(trop_csf, true_tdump, d_geoscf, suffix=suffix)
+	# Step 1 — per-row PSS fields (adds columns directly to trop_csf)
+	trop_csf = step1_pss_ratio(trop_csf, true_tdump, d_geoscf, sfx=suffix)
 
 	# Step 2 — QC screen + locate PSS point
-	trop_csf_qc, pss_row, pss_tdump_id = step2_find_pss_point(trop_csf, suffix=suffix, residual_tol=residual_tol)
-	trop_csf["step2_qc_pass"+suffix]	   = trop_csf.index.isin(trop_csf_qc.index)
-	# vvv S1 (bug): was `sfx` (undefined); corrected to `suffix`
-	trop_csf["step2_is_pss_point"+suffix]  = trop_csf["tdump_id"] == pss_tdump_id
+	trop_csf_qc, pss_row, pss_tdump_id = step2_find_pss_point(trop_csf, suffix=suffix)
+	trop_csf["step2_qc_pass"+suffix]	  = trop_csf.index.isin(trop_csf_qc.index)
+	trop_csf["step2_is_pss_point"+suffix] = trop_csf["tdump_id"] == pss_tdump_id
 
 	if pss_row.empty or np.isnan(pss_tdump_id):
 		print("  [NOx workflow] No valid PSS point found — aborting.")
@@ -796,21 +772,19 @@ def run_nox_workflow(trop_csf, true_tdump, d_geoscf, suffix="_O", option_b_or_a=
 		return trop_csf, {"status": "step3_failed"}
 
 	# Step 4 — decay correction back to t=0
-	decay = step4_decay_correction(trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix=suffix, option=option_b_or_a)
+	decay = step4_decay_correction( trop_csf_qc, pss_row, flux_nox_PSS, d_geoscf, suffix=suffix, option=option_b_or_a)
 
 	# flux_nox_fit is per-row (QC rows only) → write into trop_csf column
 	trop_csf["flux_nox_fit"+suffix] = np.nan
 	if decay["flux_nox_fit"] is not None:
 		trop_csf.loc[decay["flux_nox_fit"].index, "flux_nox_fit"+suffix] = decay["flux_nox_fit"].values
 
-	# Step 5 — collect scalar results
-	# vvv S3: nox_result keys are NOT suffixed — the caller already knows which suffix was used.
-	#		  Suffixing dict keys made nox_result's structure change shape per call, which is confusing.
+	# Step 5 — aggregate scalar nox_result (flux_nox_fit excluded; it lives in trop_csf)
 	nox_result = {
-		"status":		  "ok",
-		"pss_tdump_id":   pss_tdump_id,
-		"pss_ratio":	  pss_ratio,
-		"flux_nox_PSS":   flux_nox_PSS,
+		"status"+suffix:		   "ok",
+		"pss_tdump_id"+suffix:    pss_tdump_id,
+		"pss_ratio"+suffix:	   pss_ratio,
+		"flux_nox_PSS"+suffix:    flux_nox_PSS,
 		**{k: v for k, v in decay.items() if k != "flux_nox_fit"},
 	}
 	print("  [NOx workflow] Complete.")
