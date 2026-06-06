@@ -62,9 +62,11 @@ def _scatter_qf(ax, data_csf, age_col, val_col, color, suffix="_H", marker="o", 
 # PANEL 1 — basemap + satellite pixels + trajectory + transects
 # =============================================================================
 
-def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=0.):
-	ax.set_xlim([target["lon"] - 1.00, target["lon"] + 1.00])
-	ax.set_ylim([target["lat"] - 1.05, target["lat"] + 1.05])
+def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=0., plume_lons=0., plume_lats=0.):
+	ax.set_xlim([target["lon"] - 1.65, target["lon"] + 1.65])
+	ax.set_ylim([target["lat"] - 1.70, target["lat"] + 1.70])
+	#ax.set_xlim([target["lon"] - 1.65*0.5, target["lon"] + 1.65*0.5])
+	#ax.set_ylim([target["lat"] - 1.70*0.5, target["lat"] + 1.70*0.5])
 	for axis in ["x", "y"]:
 		ax.tick_params(axis=axis, which="both", left=False, right=False, bottom=False, top=False, labelleft=False, labelbottom=False)
 
@@ -101,7 +103,10 @@ def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H
 	# Trajectory
 	ax.plot(tdump["longitude"].values, tdump["latitude"].values, color="white", lw=0.8, linestyle="solid", marker="o", markersize=0.1)
 	if len(true_tdump) > 1:
-		ax.plot(true_tdump["longitude"].values, true_tdump["latitude"].values, color="magenta", lw=0.7, linestyle="solid", marker="o", markersize=3.0)
+		ax.plot(true_tdump["longitude"].values, true_tdump["latitude"].values, color="red", lw=0.7, linestyle="solid", marker="o", markersize=0.0)
+
+	if len(plume_lons) > 1:
+		ax.scatter(plume_lons, plume_lats, color="orange", marker="o", s=1.0)
 
 	# Transect segments
 	# data_csf_H has _H stripped so column names here are bare (a3, a4, lon_a3, etc.)
@@ -119,8 +124,8 @@ def _plot_map(ax, CFG, target, data, data_sampled, data_true_sampled, data_csf_H
 			seg_true = data_true_sampled.loc[data_true_sampled["tdump_id"] == tid]
 			fwhm_t	 = seg_true.loc[(seg_true["dist_ortho"] >= row["a3_O"] - row["a4_O"]/2) &
 									(seg_true["dist_ortho"] <= row["a3_O"] + row["a4_O"]/2)]
-			ax.plot(seg_true["lon_ortho"], seg_true["lat_ortho"], linestyle="dashed", color='magenta', lw=0.40)
-			ax.plot(fwhm_t["lon_ortho"],   fwhm_t["lat_ortho"],  linestyle="solid",  color="red",     lw=0.4, zorder=10)
+			#ax.plot(seg_true["lon_ortho"], seg_true["lat_ortho"], linestyle="dashed", color='red', lw=0.40)
+			#ax.plot(fwhm_t["lon_ortho"],   fwhm_t["lat_ortho"],  linestyle="solid",  color="red",   lw=1.0, zorder=10)
 
 	sat_label = "TROPOMI" if CFG["SATE_INFO"][0] == "trop" else "OCO-3"
 	ax.text(0.04, 0.96, f"{pd.to_datetime(sate['time_utc']).strftime('%Y-%m-%d %H:%M')} (UTC)", va="center", transform=ax.transAxes, color=style["clr_text"], fontsize=6)
@@ -209,7 +214,7 @@ def _plot_flux_vs_time(ax, CFG, data_csf, nox_result, cems_nox, flux_unit, style
 		age_H    = "age_hours_H"
 		age_O    = "age_hours_O"
 
-		ax.set_ylabel(f"Cross-sectional flux {flux_unit}")
+		ax.set_ylabel(f"Flux {flux_unit}")
 
 		# --- CSF fluxes (HYSPLIT + Optimized) ---
 		_scatter_qf(ax, data_csf, age_H, flux_var + "_H", "dodgerblue", suffix="_H", label="CSF (HYSPLIT)")
@@ -314,9 +319,7 @@ def _plot_flux_vs_time(ax, CFG, data_csf, nox_result, cems_nox, flux_unit, style
 # MAIN PLOT FUNCTION
 # =============================================================================
 
-def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump,
-			  sate, flux_unit, o_plot_wddiff, dfout,
-			  cems_nox=None, true_tdump=None, nox_result=None, data_true_sampled=[None]):
+def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump, sate, flux_unit, o_plot_wddiff, dfout, cems_nox=None, true_tdump=None, plume_lons=None, plume_lats=None, nox_result=None, data_true_sampled=[None]):
 	"""
 	Compose the three-panel CSF figure and save to dfout + '.png'.
 
@@ -343,7 +346,7 @@ def _plot_csf(CFG, target, data, data_sampled, data_csf, tdump,
 	# _O columns keep their suffix (only _H is stripped), so a3_O, a4_O etc. remain accessible.
 	data_csf_H = data_csf.rename(columns=lambda c: c[:-2] if c.endswith("_H") else c)
 
-	_plot_map(ax_map, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=true_tdump)
+	_plot_map(ax_map, CFG, target, data, data_sampled, data_true_sampled, data_csf_H, tdump, sate, style, o_plot_wddiff, true_tdump=true_tdump, plume_lons=plume_lons, plume_lats=plume_lats)
 	_plot_gaussian(ax, pp_list, CFG, data_csf, data_sampled, data_true_sampled, style)
 	# vvv: pass nox_suffix from CFG so _plot_flux_vs_time reads the correct per-row NOx columns
 	_plot_flux_vs_time(ax_flux1, CFG, data_csf, nox_result, cems_nox, flux_unit, style, var_to_plot='nox', nox_suffix=CFG["NOX_SUFFIX"])
