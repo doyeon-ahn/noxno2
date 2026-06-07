@@ -14,7 +14,6 @@ sys.path.insert(0, os.pardir)
 import CT, FN
 from csf_plot import _plot_csf
 from csf_nox import run_nox_workflow
-from csf_func_tdopt import _TDOPT_combined
 
 # =============================================================================
 # CONFIG  —  all tunable parameters live here
@@ -28,11 +27,7 @@ CFG = {
 	"SATE_INFO":		["trop", CT.DATA_VER["trop"], CT.PRCS_VER["trop"],
 						 #"2023-01-01", "2024-10-31",	# date range [start, end]
 						 #"2019-01-01", "2025-12-31",	# date range [start, end]
-						 #"2023-02-10", "2023-02-11",	# date range [start, end]; cannot be the same date
-						 #"2023-01-23", "2023-01-24",	# date range [start, end]; cannot be the same date
-						 #"2023-01-29", "2023-01-30",	# date range [start, end]; cannot be the same date
-						 #"2024-01-01", "2024-01-02",	# date range [start, end]; cannot be the same date
-						 "2024-01-16", "2024-01-17",   # date range [start, end]; cannot be the same date
+						 "2023-02-10", "2023-02-11",   # date range [start, end]; cannot be the same date
 						 "qf_good", "prcsd"],
 	"HYSTRAJ_RUN_VER":	CT.PRCS_VER["hystraj"],
 
@@ -65,7 +60,7 @@ CFG = {
 		"a1": [-50.,  50. ],				# baseline slope
 		"a2": [0.,	  1000.],				# amplitude
 		#"a3": [-50., 50.],					# centre offset [km]
-		"a3": [-100., 100.],					# centre offset [km]
+		"a3": [-200., 200.],					# centre offset [km]
 		"a4": [1.,	  40.],					# FWHM [km]
 	},
 
@@ -114,7 +109,6 @@ CFG = {
 	"o_plot":			True,			  # produce PNG plots
 	"o_plot_every":		1,				 # plot every N overpasses
 	"o_plot_wddiff":	False,			  # overlay wind-direction comparison
-	"o_plot_hysplit":	True,			# if True, also save a _hysplit.png using _H columns for comparison
 	"snapshot":			True,			  # save code snapshot on completion
 
 	# ------------------------------------------------------------------
@@ -1046,7 +1040,6 @@ def _csf_prcs(CFG, target):
 
 			# e. Optimised trajectory + CSF (_O) + quality flag
 			print ('	e. Optimised trajectory + CSF (_O) + quality flag ... ')
-			"""
 			if CFG['TDOPT']['method'] is None:
 				true_tdump = tdump.copy()
 			else:
@@ -1074,27 +1067,6 @@ def _csf_prcs(CFG, target):
 						continue
 				else:
 					continue
-			"""
-			# e. Build optimised trajectory (a3-anchored flood-fill + Dijkstra + smoothing)
-			#	 → re-sample + CSF (_O) + quality flag
-			print ('	e. Optimised trajectory + CSF (_O) + quality flag ... ')
-			true_tdump, plume_lons, plume_lats = _TDOPT_combined(
-				trop_csf_H		 = trop_csf,
-				trop			 = trop,
-				tdump			 = tdump,
-				snr_critical_pct = CFG["TDOPT"]["snr_critical_pct"],
-				poly_deg		 = CFG["TDOPT"]["smooth_poly_deg"],
-			)
-			trop_true_sampled = pd.DataFrame()
-			if len(true_tdump) < 2:
-				continue
-			trop_true_sampled = _sample_soundings_along_traj("trop", trop, true_tdump)
-			if len(trop_true_sampled) == 0:
-				continue
-			constraint_true = _define_gaussian_constraints("trop", trop_true_sampled)
-			csf_true = _calc_csf("trop", target.loc[it], trop_true_sampled, constraint_true, true_tdump, suffix="_O")
-			csf_true = _calc_qf_gauss(csf_true, suffix="_O")
-			trop_csf = trop_csf.merge(csf_true, on="tdump_id", how="left")
 
 			# f. Run NOx workflow, save CSV
 			print ('	f. Run NOx workflow, save CSV ... ')
@@ -1115,12 +1087,11 @@ def _csf_prcs(CFG, target):
 				if not cems_nox.empty:
 					print(f"  [CEMS] {len(cems_nox)} records, mean = {cems_nox['noxMass_tph_metric'].mean():.2f} {CFG['FLUX_UNIT']}")
 
-				plot_kwargs= dict(
+				plot_kwargs = dict(
 					CFG				 = CFG,
 					target			 = target.loc[it],
 					data			 = trop,
 					data_sampled	 = trop_sampled,
-					data_true_sampled= trop_true_sampled,
 					data_csf		 = trop_csf,
 					tdump			 = tdump,
 					sate			 = sate_row,
@@ -1129,11 +1100,10 @@ def _csf_prcs(CFG, target):
 					dfout			 = dout_png + fout,
 					cems_nox		 = cems_nox,
 					true_tdump		 = true_tdump,
-					nox_result		 = nox_result,
 					plume_lons		 = plume_lons,
 					plume_lats		 = plume_lats,
+					nox_result		 = nox_result,
 				)
-
 				if CFG['TDOPT']['method'] is not None:
 					plot_kwargs['data_true_sampled'] = trop_true_sampled
 				_plot_csf(**plot_kwargs)
