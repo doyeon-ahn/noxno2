@@ -398,22 +398,20 @@ def _calc_csf(satellite, target, data, constraint, tdump, suffix):
 	Wind summary(suffixed):    wd_std{s}, wd_diff{s}
 	"""
 	s = suffix	 # short alias used throughout
-	#merge_cols = ["tdump_id","longitude","latitude","age_hours","month","hour","temp","pres","wso","wd","time_tag"]
-	merge_cols = ["tdump_id","longitude","latitude","age_hours",							 "wso","wd"			  ]
+	merge_cols = ["tdump_id","longitude","latitude","age_hours","age_km","wso","wd"] + \
+				 (["time_tag"] if "time_tag" in tdump.columns else [])
 	out = (pd.DataFrame({"tdump_id": data["tdump_id"].unique()})
 			 .merge(tdump[merge_cols], on="tdump_id", how="left")
 			 .rename(columns={
 					"longitude":  f"lon_tdump{s}",
-					"latitude":  f"lat_tdump{s}",
+					"latitude":   f"lat_tdump{s}",
 					"age_hours":  f"age_hours{s}",
-					#"month":	  f"month{s}",
-					#"hour":	   f"hour{s}",
-					#"temp":	   f"temp{s}",
-					#"pres":	   f"pres{s}",
-					"wso":		f"wso{s}",
-					"wd":		f"wd{s}",
-					#"time_tag":  f"time_tag{s}",
+					"age_km":	  f"age_km{s}",
+					"wso":		  f"wso{s}",
+					"wd":		  f"wd{s}",
+					"time_tag":   f"time_tag{s}",
 			 }))
+
 
 	#out[f"month{s}"] = out[f"month{s}"].values.astype(int)
 	voi = "no2" if satellite == "trop" else None

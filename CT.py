@@ -22,6 +22,7 @@ DATA_VER=   {
 
 PRCS_VER = {
     'trop':         'v26.03.07',
+    'pace':         'v26.06.06',
 	'hystraj':		'v26.03.07',
 	'csf':			'v26.03.31',
 	'post':			'v26.03.07',
